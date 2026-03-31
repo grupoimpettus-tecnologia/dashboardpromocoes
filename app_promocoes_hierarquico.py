@@ -90,14 +90,11 @@ CREDENCIAIS = {
     "senha": "250913"
 }
 
-def _normalizar_texto(valor):
-    """Normaliza texto para comparações tolerantes a acento e caixa."""
-    if valor is None:
-        return ""
+def _normalizar_grupo(valor):
+    """Normaliza nome de grupo para comparação consistente."""
+    texto = str(valor or "").strip().upper()
     return (
-        str(valor)
-        .strip()
-        .upper()
+        texto
         .replace("Ç", "C")
         .replace("Ã", "A")
         .replace("Á", "A")
@@ -112,176 +109,20 @@ def _normalizar_texto(valor):
         .replace("Ú", "U")
     )
 
-def _normalizar_codigo_produto(valor):
-    """Normaliza código de produto para comparação entre fontes distintas."""
-    if pd.isna(valor):
-        return ""
-    texto = str(valor).strip()
-    if texto.endswith(".0"):
-        texto = texto[:-2]
-    return texto.replace(".", "").replace(",", "").replace(" ", "")
-
-def _extrair_lista_de_objeto(dados):
-    """Extrai lista de itens de um objeto/array de resposta da API."""
-    if isinstance(dados, list):
-        return dados
-    if isinstance(dados, dict):
-        for chave in ("data", "produtos", "itens", "items", "resultado", "content", "movimentos"):
-            valor = dados.get(chave)
-            if isinstance(valor, list):
-                return valor
-    return []
-
-def enriquecer_clicks_promocoes_rede_tempo_real(df_marca, marca, modo_validacao=False, logs_validacao=None):
-    """
-    Busca em tempo real os usos dos produtos no endpoint MovProdutos
-    e preenche apenas linhas do grupo PROMOÇÕES REDE.
-    """
-    if df_marca.empty:
-        return df_marca
-
-    df_resultado = df_marca.copy()
-    if "quantidadeClicksProduto" not in df_resultado.columns:
-        df_resultado["quantidadeClicksProduto"] = 0
-
-    colunas_obrigatorias = {"nomeGrupo", "codigoLoja", "codigoProduto"}
-    if not colunas_obrigatorias.issubset(set(df_resultado.columns)):
-        return df_resultado
-
-    mask_rede = df_resultado["nomeGrupo"].apply(
-        lambda v: "PROMOCOES REDE" in _normalizar_texto(v)
+def _grupo_deve_exibir_sequencia(nome_grupo):
+    grupo = _normalizar_grupo(nome_grupo)
+    return (
+        "HAPPY HOUR" in grupo
+        or "PROMOCOES DA UNIDADE" in grupo
+        or "PROMOCOES REDE" in grupo
     )
-    if not mask_rede.any():
-        return df_resultado
 
-    config = MARCAS_CONFIG.get(marca, {})
-    codfranqueador = config.get("codfranqueador")
-    if not codfranqueador:
-        return df_resultado
-
-    token = autenticar(codfranqueador)
-    if not token:
-        return df_resultado
-
-    url_mov = "https://lx-degust-api-integracao-prd.azurewebsites.net/api/movimentacao/MovProdutos"
-    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-    cod_franqueador_mov = str(codfranqueador)
-
-    df_rede = df_resultado[mask_rede].copy()
-    mapa_clicks = {}
-
-    data_inicio_str = (datetime.now().date() - pd.Timedelta(days=7)).strftime("%Y-%m-%d")
-
-    for codigo_loja in sorted(df_rede["codigoLoja"].dropna().unique().tolist()):
-        lista_movimentos = []
-        corpo_base_1 = {"codFranqueador": cod_franqueador_mov, "codLoja": str(codigo_loja)}
-        corpo_base_2 = {"codFranqueador": cod_franqueador_mov, "codigoLoja": str(codigo_loja)}
-        # Regra solicitada: considerar últimos 7 dias e somar futuros,
-        # então enviamos somente dataInicial (sem dataFinal).
-        corpo_base_1["dataInicial"] = data_inicio_str
-        corpo_base_2["dataInicial"] = data_inicio_str
-        bodies = [corpo_base_1, corpo_base_2]
-
-        for body in bodies:
-            try:
-                resp = requests.post(url_mov, json=body, headers=headers, timeout=15)
-                if modo_validacao and logs_validacao is not None:
-                    logs_validacao.append({
-                        "marca": marca,
-                        "codigoLoja": str(codigo_loja),
-                        "metodo": "POST",
-                        "status": resp.status_code,
-                        "payload": str(body),
-                        "registrosRetornados": 0,
-                        "observacao": "Tentativa de consulta MovProdutos"
-                    })
-                if resp.status_code == 200:
-                    lista_movimentos = _extrair_lista_de_objeto(resp.json())
-                    if modo_validacao and logs_validacao is not None and logs_validacao:
-                        logs_validacao[-1]["registrosRetornados"] = len(lista_movimentos)
-                        logs_validacao[-1]["observacao"] = "Retorno de sucesso"
-                    if lista_movimentos:
-                        break
-            except Exception:
-                if modo_validacao and logs_validacao is not None:
-                    logs_validacao.append({
-                        "marca": marca,
-                        "codigoLoja": str(codigo_loja),
-                        "metodo": "POST",
-                        "status": "erro",
-                        "payload": str(body),
-                        "registrosRetornados": 0,
-                        "observacao": "Falha de conexão/exceção na consulta"
-                    })
-                continue
-
-        if not lista_movimentos:
-            try:
-                params = {"codFranqueador": cod_franqueador_mov, "codLoja": str(codigo_loja)}
-                params["dataInicial"] = data_inicio_str
-                resp_get = requests.get(url_mov, params=params, headers=headers, timeout=15)
-                if modo_validacao and logs_validacao is not None:
-                    logs_validacao.append({
-                        "marca": marca,
-                        "codigoLoja": str(codigo_loja),
-                        "metodo": "GET",
-                        "status": resp_get.status_code,
-                        "payload": str(params),
-                        "registrosRetornados": 0,
-                        "observacao": "Fallback GET MovProdutos"
-                    })
-                if resp_get.status_code == 200:
-                    lista_movimentos = _extrair_lista_de_objeto(resp_get.json())
-                    if modo_validacao and logs_validacao is not None and logs_validacao:
-                        logs_validacao[-1]["registrosRetornados"] = len(lista_movimentos)
-                        logs_validacao[-1]["observacao"] = "Retorno de sucesso (fallback GET)"
-            except Exception:
-                if modo_validacao and logs_validacao is not None:
-                    logs_validacao.append({
-                        "marca": marca,
-                        "codigoLoja": str(codigo_loja),
-                        "metodo": "GET",
-                        "status": "erro",
-                        "payload": str({"codFranqueador": cod_franqueador_mov, "codLoja": str(codigo_loja), "dataInicial": data_inicio_str}),
-                        "registrosRetornados": 0,
-                        "observacao": "Falha no fallback GET"
-                    })
-                pass
-
-        for mov in lista_movimentos:
-            codigo_produto = (
-                mov.get("codProduto")
-                or mov.get("codigoProduto")
-                or mov.get("produto")
-                or mov.get("idProduto")
-                or mov.get("codigo")
-            )
-            codigo_norm = _normalizar_codigo_produto(codigo_produto)
-            if not codigo_norm:
-                continue
-
-            quantidade = (
-                mov.get("quantidade")
-                or mov.get("qtde")
-                or mov.get("qtd")
-                or mov.get("quantidadeUtilizada")
-                or mov.get("total")
-                or 0
-            )
-            try:
-                quantidade_float = float(quantidade)
-            except Exception:
-                quantidade_float = 0
-
-            chave = (codigo_loja, codigo_norm)
-            mapa_clicks[chave] = mapa_clicks.get(chave, 0) + quantidade_float
-
-    for idx, row in df_rede.iterrows():
-        codigo_norm = _normalizar_codigo_produto(row.get("codigoProduto"))
-        chave = (row.get("codigoLoja"), codigo_norm)
-        df_resultado.at[idx, "quantidadeClicksProduto"] = int(mapa_clicks.get(chave, 0))
-
-    return df_resultado
+def _extrair_sequencia_promocao(row, nome_grupo):
+    """Retorna sequência quando o grupo exige exibição da ordem da promoção."""
+    if not _grupo_deve_exibir_sequencia(nome_grupo):
+        return None
+    sequencia = row.get("sequencia", None)
+    return sequencia if sequencia not in ("", "None") else None
 
 def autenticar(codfranqueador):
     """Realiza autenticação na API do Degust"""
@@ -827,6 +668,8 @@ def agrupar_por_loja_e_promocao(df):
         
         # Agrupar promoções dentro da loja
         nome_promocao = row.get('nomePromocao', 'Sem Nome')
+        nome_grupo_row = row.get('nomeGrupo', 'N/A')
+        sequencia_row = _extrair_sequencia_promocao(row, nome_grupo_row)
         
         # Para TODAS as marcas: se o nome da promoção contém "PROMOÇÕES", garantir que existe
         # e que os produtos normais vão para a seção "PROMOÇÕES - {NOME_LOJA}"
@@ -840,7 +683,7 @@ def agrupar_por_loja_e_promocao(df):
                         'nomePromocao': nome_promocao_base,
                         'promocaoAtiva': 'Sim',
                         'nomeGrupo': 'PROMOÇÕES DA UNIDADE',
-                        'sequencia': None
+                        'sequencia': sequencia_row
                     },
                     'produtos': [],
                     'categorias': {}
@@ -848,18 +691,15 @@ def agrupar_por_loja_e_promocao(df):
             nome_promocao = nome_promocao_base
         
         if nome_promocao not in grupos_lojas[chave_loja]['promocoes']:
-            nome_grupo = row.get('nomeGrupo', 'N/A')
-            # Incluir sequência apenas para Happy Hour
-            sequencia = None
-            if nome_grupo and 'HAPPY HOUR' in nome_grupo.upper():
-                sequencia = row.get('sequencia', None)
+            nome_grupo = nome_grupo_row
+            sequencia = sequencia_row
             
             grupos_lojas[chave_loja]['promocoes'][nome_promocao] = {
                 'info_promocao': {
                     'nomePromocao': nome_promocao,
                     'promocaoAtiva': row.get('promocaoAtiva', 'N/A'),
                     'nomeGrupo': nome_grupo,
-                    'sequencia': sequencia  # Incluir sequência se for Happy Hour
+                    'sequencia': sequencia
                 },
                 'produtos': [],
                 'categorias': {}  # Nova estrutura para categorias de grupo de venda orientada
@@ -868,12 +708,15 @@ def agrupar_por_loja_e_promocao(df):
             # Garantir que a estrutura de categorias existe mesmo se a promoção já foi criada
             if 'categorias' not in grupos_lojas[chave_loja]['promocoes'][nome_promocao]:
                 grupos_lojas[chave_loja]['promocoes'][nome_promocao]['categorias'] = {}
+            # Se a promoção já existe e ainda não tem sequência, preencher quando houver no dado atual.
+            info_promocao_existente = grupos_lojas[chave_loja]['promocoes'][nome_promocao]['info_promocao']
+            if info_promocao_existente.get('sequencia') in (None, "", "None") and sequencia_row is not None:
+                info_promocao_existente['sequencia'] = sequencia_row
         
         # Adicionar produto
         produto = {
             'codigoProduto': row.get('codigoProduto', 'N/A'),
             'descricaoProduto': row.get('descricaoProduto', 'N/A'),
-            'quantidadeClicksProduto': row.get('quantidadeClicksProduto', 0),
             'produtoPromocaoAtivo': row.get('produtoPromocaoAtivo', 'N/A'),
             'domingo': row.get('domingo', 'N/A'),
             'segunda': row.get('segunda', 'N/A'),
@@ -1022,21 +865,7 @@ def exibir_promocao_dentro_loja(nome_promocao, dados_promocao, cor_marca):
         col1, col2, col3, col4 = st.columns([4, 2, 2, 1])
         
         with col1:
-            nome_grupo_promocao = dados_promocao['info_promocao'].get('nomeGrupo', '')
-            eh_promocao_rede = "PROMOCOES REDE" in _normalizar_texto(nome_grupo_promocao)
-            total_clicks_loja = 0
-            for produto in dados_promocao.get('produtos', []):
-                try:
-                    total_clicks_loja += float(produto.get('quantidadeClicksProduto', 0) or 0)
-                except Exception:
-                    continue
-            if eh_promocao_rede:
-                st.markdown(
-                    f"**📦 {nome_promocao}**  \n"
-                    f"Quantidade de clicks da loja: **{int(total_clicks_loja)}**"
-                )
-            else:
-                st.markdown(f"**📦 {nome_promocao}**")
+            st.markdown(f"**📦 {nome_promocao}**")
         
         with col2:
             status = "🟢 Ativo" if dados_promocao['info_promocao']['promocaoAtiva'] == 'Sim' else "🔴 Inativo"
@@ -1045,8 +874,7 @@ def exibir_promocao_dentro_loja(nome_promocao, dados_promocao, cor_marca):
         with col3:
             nome_grupo = dados_promocao['info_promocao']['nomeGrupo']
             sequencia = dados_promocao['info_promocao'].get('sequencia')
-            # Exibir sequência antes do grupo apenas para Happy Hour
-            if sequencia is not None and nome_grupo and 'HAPPY HOUR' in nome_grupo.upper():
+            if sequencia is not None and _grupo_deve_exibir_sequencia(nome_grupo):
                 st.markdown(f"**N{sequencia} - Grupo:** {nome_grupo}")
             else:
                 st.markdown(f"**Grupo:** {nome_grupo}")
@@ -1066,7 +894,7 @@ def exibir_promocao_dentro_loja(nome_promocao, dados_promocao, cor_marca):
             
             # Reordenar colunas para melhor visualização
             colunas_ordenadas = [
-                'codigoProduto', 'descricaoProduto', 'quantidadeClicksProduto',
+                'codigoProduto', 'descricaoProduto',
                 'domingo', 'segunda', 'terca', 'quarta', 'quinta', 'sexta', 'sabado', 'restricaoHorario',
                 'valorPromocionalMix', 'valorMix'
             ]
@@ -1140,8 +968,7 @@ def exibir_promocao_inativa_simples(nome_promocao, dados_promocao, cor_marca):
         with col3:
             nome_grupo = dados_promocao['info_promocao']['nomeGrupo']
             sequencia = dados_promocao['info_promocao'].get('sequencia')
-            # Exibir sequência antes do grupo apenas para Happy Hour
-            if sequencia is not None and nome_grupo and 'HAPPY HOUR' in nome_grupo.upper():
+            if sequencia is not None and _grupo_deve_exibir_sequencia(nome_grupo):
                 st.markdown(f"**N{sequencia} - Grupo:** {nome_grupo}")
             else:
                 st.markdown(f"**Grupo:** {nome_grupo}")
@@ -1193,12 +1020,6 @@ def main():
             st.rerun()
         
         st.markdown("---")
-        st.caption("Clicks da loja: consulta automática dos últimos 7 dias, acumulando novos clicks futuros.")
-        modo_validacao_clicks = st.checkbox(
-            "🧪 Modo validação de clicks (payload/status/registros)",
-            value=False,
-            help="Exibe detalhes técnicos da chamada MovProdutos para auditoria."
-        )
         st.markdown("---")
         
         # Filtro de marcas
@@ -1224,21 +1045,10 @@ def main():
     
     # Carregar dados de todas as marcas selecionadas
     todos_dados = []
-    logs_clicks_por_marca = {}
-    
     for marca in marcas_selecionadas:
         with st.spinner(f"Carregando dados de {marca}..."):
             df_marca = carregar_dados_marca(marca)
             if not df_marca.empty:
-                logs_clicks = []
-                with st.spinner(f"Consultando clicks em tempo real ({marca})..."):
-                    df_marca = enriquecer_clicks_promocoes_rede_tempo_real(
-                        df_marca,
-                        marca,
-                        modo_validacao=modo_validacao_clicks,
-                        logs_validacao=logs_clicks
-                    )
-                logs_clicks_por_marca[marca] = logs_clicks
                 todos_dados.append(df_marca)
     
     if not todos_dados:
@@ -1290,15 +1100,6 @@ def main():
             
             st.markdown(f"### <span style='color: {cor}'>{marca}</span>", unsafe_allow_html=True)
 
-            if modo_validacao_clicks:
-                logs_marca = logs_clicks_por_marca.get(marca, [])
-                with st.expander(f"🧪 Validação técnica de clicks - {marca}", expanded=False):
-                    if logs_marca:
-                        df_logs = pd.DataFrame(logs_marca)
-                        st.dataframe(df_logs, use_container_width=True, height=250)
-                    else:
-                        st.info("Nenhum log de validação disponível para esta marca.")
-            
             # Agrupar dados por loja e promoção
             grupos_lojas = agrupar_por_loja_e_promocao(df_marca)
             
