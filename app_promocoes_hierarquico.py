@@ -90,6 +90,145 @@ CREDENCIAIS = {
     "senha": "250913"
 }
 
+def _normalizar_texto(valor):
+    """Normaliza texto para comparações tolerantes a acento e caixa."""
+    if valor is None:
+        return ""
+    return (
+        str(valor)
+        .strip()
+        .upper()
+        .replace("Ç", "C")
+        .replace("Ã", "A")
+        .replace("Á", "A")
+        .replace("Â", "A")
+        .replace("À", "A")
+        .replace("É", "E")
+        .replace("Ê", "E")
+        .replace("Í", "I")
+        .replace("Ó", "O")
+        .replace("Ô", "O")
+        .replace("Õ", "O")
+        .replace("Ú", "U")
+    )
+
+def _normalizar_codigo_produto(valor):
+    """Normaliza código de produto para comparação entre fontes distintas."""
+    if pd.isna(valor):
+        return ""
+    texto = str(valor).strip()
+    if texto.endswith(".0"):
+        texto = texto[:-2]
+    return texto.replace(".", "").replace(",", "").replace(" ", "")
+
+def _extrair_lista_de_objeto(dados):
+    """Extrai lista de itens de um objeto/array de resposta da API."""
+    if isinstance(dados, list):
+        return dados
+    if isinstance(dados, dict):
+        for chave in ("data", "produtos", "itens", "items", "resultado", "content", "movimentos"):
+            valor = dados.get(chave)
+            if isinstance(valor, list):
+                return valor
+    return []
+
+def enriquecer_clicks_promocoes_rede_tempo_real(df_marca, marca):
+    """
+    Busca em tempo real os usos dos produtos no endpoint MovProdutos
+    e preenche apenas linhas do grupo PROMOÇÕES REDE.
+    """
+    if df_marca.empty:
+        return df_marca
+
+    df_resultado = df_marca.copy()
+    if "quantidadeClicksProduto" not in df_resultado.columns:
+        df_resultado["quantidadeClicksProduto"] = 0
+
+    colunas_obrigatorias = {"nomeGrupo", "codigoLoja", "codigoProduto"}
+    if not colunas_obrigatorias.issubset(set(df_resultado.columns)):
+        return df_resultado
+
+    mask_rede = df_resultado["nomeGrupo"].apply(
+        lambda v: "PROMOCOES REDE" in _normalizar_texto(v)
+    )
+    if not mask_rede.any():
+        return df_resultado
+
+    config = MARCAS_CONFIG.get(marca, {})
+    codfranqueador = config.get("codfranqueador")
+    if not codfranqueador:
+        return df_resultado
+
+    token = autenticar(codfranqueador)
+    if not token:
+        return df_resultado
+
+    url_mov = "https://lx-degust-api-integracao-prd.azurewebsites.net/api/movimentacao/MovProdutos"
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+
+    df_rede = df_resultado[mask_rede].copy()
+    mapa_clicks = {}
+
+    for codigo_loja in sorted(df_rede["codigoLoja"].dropna().unique().tolist()):
+        lista_movimentos = []
+        bodies = [
+            {"codigoFranquia": codfranqueador, "codigoLoja": codigo_loja},
+            {"codigoFranqueador": codfranqueador, "codigoLoja": codigo_loja},
+        ]
+
+        for body in bodies:
+            try:
+                resp = requests.post(url_mov, json=body, headers=headers, timeout=15)
+                if resp.status_code == 200:
+                    lista_movimentos = _extrair_lista_de_objeto(resp.json())
+                    if lista_movimentos:
+                        break
+            except Exception:
+                continue
+
+        if not lista_movimentos:
+            try:
+                params = {"codigoFranquia": codfranqueador, "codigoLoja": codigo_loja}
+                resp_get = requests.get(url_mov, params=params, headers=headers, timeout=15)
+                if resp_get.status_code == 200:
+                    lista_movimentos = _extrair_lista_de_objeto(resp_get.json())
+            except Exception:
+                pass
+
+        for mov in lista_movimentos:
+            codigo_produto = (
+                mov.get("codigoProduto")
+                or mov.get("produto")
+                or mov.get("idProduto")
+                or mov.get("codigo")
+            )
+            codigo_norm = _normalizar_codigo_produto(codigo_produto)
+            if not codigo_norm:
+                continue
+
+            quantidade = (
+                mov.get("quantidade")
+                or mov.get("qtde")
+                or mov.get("qtd")
+                or mov.get("quantidadeUtilizada")
+                or mov.get("total")
+                or 0
+            )
+            try:
+                quantidade_float = float(quantidade)
+            except Exception:
+                quantidade_float = 0
+
+            chave = (codigo_loja, codigo_norm)
+            mapa_clicks[chave] = mapa_clicks.get(chave, 0) + quantidade_float
+
+    for idx, row in df_rede.iterrows():
+        codigo_norm = _normalizar_codigo_produto(row.get("codigoProduto"))
+        chave = (row.get("codigoLoja"), codigo_norm)
+        df_resultado.at[idx, "quantidadeClicksProduto"] = int(mapa_clicks.get(chave, 0))
+
+    return df_resultado
+
 def autenticar(codfranqueador):
     """Realiza autenticação na API do Degust"""
     url_auth = "https://lx-degust-api-integracao-prd.azurewebsites.net/api/usuario/autenticar"
@@ -680,6 +819,7 @@ def agrupar_por_loja_e_promocao(df):
         produto = {
             'codigoProduto': row.get('codigoProduto', 'N/A'),
             'descricaoProduto': row.get('descricaoProduto', 'N/A'),
+            'quantidadeClicksProduto': row.get('quantidadeClicksProduto', 0),
             'produtoPromocaoAtivo': row.get('produtoPromocaoAtivo', 'N/A'),
             'domingo': row.get('domingo', 'N/A'),
             'segunda': row.get('segunda', 'N/A'),
@@ -828,7 +968,21 @@ def exibir_promocao_dentro_loja(nome_promocao, dados_promocao, cor_marca):
         col1, col2, col3, col4 = st.columns([4, 2, 2, 1])
         
         with col1:
-            st.markdown(f"**📦 {nome_promocao}**")
+            nome_grupo_promocao = dados_promocao['info_promocao'].get('nomeGrupo', '')
+            eh_promocao_rede = "PROMOCOES REDE" in _normalizar_texto(nome_grupo_promocao)
+            total_clicks_loja = 0
+            for produto in dados_promocao.get('produtos', []):
+                try:
+                    total_clicks_loja += float(produto.get('quantidadeClicksProduto', 0) or 0)
+                except Exception:
+                    continue
+            if eh_promocao_rede:
+                st.markdown(
+                    f"**📦 {nome_promocao}**  \n"
+                    f"Quantidade de clicks da loja: **{int(total_clicks_loja)}**"
+                )
+            else:
+                st.markdown(f"**📦 {nome_promocao}**")
         
         with col2:
             status = "🟢 Ativo" if dados_promocao['info_promocao']['promocaoAtiva'] == 'Sim' else "🔴 Inativo"
@@ -858,7 +1012,7 @@ def exibir_promocao_dentro_loja(nome_promocao, dados_promocao, cor_marca):
             
             # Reordenar colunas para melhor visualização
             colunas_ordenadas = [
-                'codigoProduto', 'descricaoProduto',
+                'codigoProduto', 'descricaoProduto', 'quantidadeClicksProduto',
                 'domingo', 'segunda', 'terca', 'quarta', 'quinta', 'sexta', 'sabado', 'restricaoHorario',
                 'valorPromocionalMix', 'valorMix'
             ]
@@ -1014,6 +1168,8 @@ def main():
         with st.spinner(f"Carregando dados de {marca}..."):
             df_marca = carregar_dados_marca(marca)
             if not df_marca.empty:
+                with st.spinner(f"Consultando clicks em tempo real ({marca})..."):
+                    df_marca = enriquecer_clicks_promocoes_rede_tempo_real(df_marca, marca)
                 todos_dados.append(df_marca)
     
     if not todos_dados:
