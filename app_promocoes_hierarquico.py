@@ -132,7 +132,43 @@ def _extrair_lista_de_objeto(dados):
                 return valor
     return []
 
-def enriquecer_clicks_promocoes_rede_tempo_real(df_marca, marca):
+def _somar_quantidade_movimentos(lista_movimentos):
+    """Soma quantidade em lista de movimentos com tolerância a variações de chave."""
+    total = 0.0
+    for mov in lista_movimentos or []:
+        quantidade = (
+            mov.get("quantidade")
+            or mov.get("qtde")
+            or mov.get("qtd")
+            or mov.get("quantidadeUtilizada")
+            or mov.get("total")
+            or 0
+        )
+        try:
+            total += float(quantidade)
+        except Exception:
+            continue
+    return total
+
+def _obter_data_criacao_produto(row):
+    """Obtém a data de criação do produto a partir das possíveis colunas disponíveis."""
+    campos_data = [
+        "dataCriacaoProduto",
+        "dataCadastroProduto",
+        "dataCriacao",
+        "dataCadastro",
+        "createdAt",
+    ]
+    for campo in campos_data:
+        valor = row.get(campo)
+        if valor is None or str(valor).strip() == "":
+            continue
+        data = pd.to_datetime(valor, errors="coerce", dayfirst=True)
+        if pd.notna(data):
+            return data.date()
+    return None
+
+def enriquecer_clicks_promocoes_rede_tempo_real(df_marca, marca, data_inicio=None, data_fim=None):
     """
     Busca em tempo real os usos dos produtos no endpoint MovProdutos
     e preenche apenas linhas do grupo PROMOÇÕES REDE.
@@ -168,13 +204,21 @@ def enriquecer_clicks_promocoes_rede_tempo_real(df_marca, marca):
 
     df_rede = df_resultado[mask_rede].copy()
     mapa_clicks = {}
+    mapa_clicks_desde_criacao = {}
+
+    data_inicio_str = data_inicio.strftime("%Y-%m-%d") if data_inicio else None
+    data_fim_str = data_fim.strftime("%Y-%m-%d") if data_fim else None
 
     for codigo_loja in sorted(df_rede["codigoLoja"].dropna().unique().tolist()):
         lista_movimentos = []
-        bodies = [
-            {"codigoFranquia": codfranqueador, "codigoLoja": codigo_loja},
-            {"codigoFranqueador": codfranqueador, "codigoLoja": codigo_loja},
-        ]
+        corpo_base_1 = {"codigoFranquia": codfranqueador, "codigoLoja": codigo_loja}
+        corpo_base_2 = {"codigoFranqueador": codfranqueador, "codigoLoja": codigo_loja}
+        if data_inicio_str and data_fim_str:
+            corpo_base_1["dataInicial"] = data_inicio_str
+            corpo_base_1["dataFinal"] = data_fim_str
+            corpo_base_2["dataInicial"] = data_inicio_str
+            corpo_base_2["dataFinal"] = data_fim_str
+        bodies = [corpo_base_1, corpo_base_2]
 
         for body in bodies:
             try:
@@ -189,6 +233,9 @@ def enriquecer_clicks_promocoes_rede_tempo_real(df_marca, marca):
         if not lista_movimentos:
             try:
                 params = {"codigoFranquia": codfranqueador, "codigoLoja": codigo_loja}
+                if data_inicio_str and data_fim_str:
+                    params["dataInicial"] = data_inicio_str
+                    params["dataFinal"] = data_fim_str
                 resp_get = requests.get(url_mov, params=params, headers=headers, timeout=15)
                 if resp_get.status_code == 200:
                     lista_movimentos = _extrair_lista_de_objeto(resp_get.json())
@@ -222,10 +269,98 @@ def enriquecer_clicks_promocoes_rede_tempo_real(df_marca, marca):
             chave = (codigo_loja, codigo_norm)
             mapa_clicks[chave] = mapa_clicks.get(chave, 0) + quantidade_float
 
+    # Consulta adicional: clicks desde a criação do produto até hoje
+    hoje = datetime.now().date()
+    produtos_rede_unicos = (
+        df_rede[["codigoLoja", "codigoProduto"]]
+        .dropna()
+        .drop_duplicates()
+    )
+    for _, row_produto in produtos_rede_unicos.iterrows():
+        codigo_loja = row_produto.get("codigoLoja")
+        codigo_produto_original = row_produto.get("codigoProduto")
+        codigo_produto_norm = _normalizar_codigo_produto(codigo_produto_original)
+        if not codigo_produto_norm:
+            continue
+
+        linhas_produto = df_rede[
+            (df_rede["codigoLoja"] == codigo_loja) &
+            (df_rede["codigoProduto"].apply(_normalizar_codigo_produto) == codigo_produto_norm)
+        ]
+        data_criacao = None
+        for _, linha in linhas_produto.iterrows():
+            data_criacao = _obter_data_criacao_produto(linha)
+            if data_criacao:
+                break
+
+        if not data_criacao:
+            mapa_clicks_desde_criacao[(codigo_loja, codigo_produto_norm)] = 0
+            continue
+
+        if data_criacao > hoje:
+            data_criacao = hoje
+
+        data_inicio_produto = data_criacao.strftime("%Y-%m-%d")
+        data_fim_produto = hoje.strftime("%Y-%m-%d")
+        lista_movimentos_produto = []
+
+        bodies_produto = [
+            {
+                "codigoFranquia": codfranqueador,
+                "codigoLoja": codigo_loja,
+                "codigoProduto": codigo_produto_original,
+                "dataInicial": data_inicio_produto,
+                "dataFinal": data_fim_produto,
+            },
+            {
+                "codigoFranqueador": codfranqueador,
+                "codigoLoja": codigo_loja,
+                "codigoProduto": codigo_produto_original,
+                "dataInicial": data_inicio_produto,
+                "dataFinal": data_fim_produto,
+            },
+            {
+                "codigoFranquia": codfranqueador,
+                "codigoLoja": codigo_loja,
+                "produto": codigo_produto_original,
+                "dataInicial": data_inicio_produto,
+                "dataFinal": data_fim_produto,
+            },
+        ]
+
+        for body in bodies_produto:
+            try:
+                resp = requests.post(url_mov, json=body, headers=headers, timeout=15)
+                if resp.status_code == 200:
+                    lista_movimentos_produto = _extrair_lista_de_objeto(resp.json())
+                    if lista_movimentos_produto:
+                        break
+            except Exception:
+                continue
+
+        if not lista_movimentos_produto:
+            try:
+                params = {
+                    "codigoFranquia": codfranqueador,
+                    "codigoLoja": codigo_loja,
+                    "codigoProduto": codigo_produto_original,
+                    "dataInicial": data_inicio_produto,
+                    "dataFinal": data_fim_produto,
+                }
+                resp_get = requests.get(url_mov, params=params, headers=headers, timeout=15)
+                if resp_get.status_code == 200:
+                    lista_movimentos_produto = _extrair_lista_de_objeto(resp_get.json())
+            except Exception:
+                pass
+
+        total_desde_criacao = _somar_quantidade_movimentos(lista_movimentos_produto)
+        mapa_clicks_desde_criacao[(codigo_loja, codigo_produto_norm)] = total_desde_criacao
+
     for idx, row in df_rede.iterrows():
         codigo_norm = _normalizar_codigo_produto(row.get("codigoProduto"))
         chave = (row.get("codigoLoja"), codigo_norm)
         df_resultado.at[idx, "quantidadeClicksProduto"] = int(mapa_clicks.get(chave, 0))
+        df_resultado.at[idx, "quantidadeClicksDesdeCriacaoProduto"] = int(mapa_clicks_desde_criacao.get(chave, 0))
 
     return df_resultado
 
@@ -820,6 +955,7 @@ def agrupar_por_loja_e_promocao(df):
             'codigoProduto': row.get('codigoProduto', 'N/A'),
             'descricaoProduto': row.get('descricaoProduto', 'N/A'),
             'quantidadeClicksProduto': row.get('quantidadeClicksProduto', 0),
+            'quantidadeClicksDesdeCriacaoProduto': row.get('quantidadeClicksDesdeCriacaoProduto', 0),
             'produtoPromocaoAtivo': row.get('produtoPromocaoAtivo', 'N/A'),
             'domingo': row.get('domingo', 'N/A'),
             'segunda': row.get('segunda', 'N/A'),
@@ -971,15 +1107,21 @@ def exibir_promocao_dentro_loja(nome_promocao, dados_promocao, cor_marca):
             nome_grupo_promocao = dados_promocao['info_promocao'].get('nomeGrupo', '')
             eh_promocao_rede = "PROMOCOES REDE" in _normalizar_texto(nome_grupo_promocao)
             total_clicks_loja = 0
+            total_clicks_loja_desde_criacao = 0
             for produto in dados_promocao.get('produtos', []):
                 try:
                     total_clicks_loja += float(produto.get('quantidadeClicksProduto', 0) or 0)
                 except Exception:
                     continue
+                try:
+                    total_clicks_loja_desde_criacao += float(produto.get('quantidadeClicksDesdeCriacaoProduto', 0) or 0)
+                except Exception:
+                    continue
             if eh_promocao_rede:
                 st.markdown(
                     f"**📦 {nome_promocao}**  \n"
-                    f"Quantidade de clicks da loja: **{int(total_clicks_loja)}**"
+                    f"Quantidade de clicks da loja: **{int(total_clicks_loja)}**  \n"
+                    f"Quantidade de clicks desde a data de criação do produto até o dia atual: **{int(total_clicks_loja_desde_criacao)}**"
                 )
             else:
                 st.markdown(f"**📦 {nome_promocao}**")
@@ -1012,7 +1154,7 @@ def exibir_promocao_dentro_loja(nome_promocao, dados_promocao, cor_marca):
             
             # Reordenar colunas para melhor visualização
             colunas_ordenadas = [
-                'codigoProduto', 'descricaoProduto', 'quantidadeClicksProduto',
+                'codigoProduto', 'descricaoProduto', 'quantidadeClicksProduto', 'quantidadeClicksDesdeCriacaoProduto',
                 'domingo', 'segunda', 'terca', 'quarta', 'quinta', 'sexta', 'sabado', 'restricaoHorario',
                 'valorPromocionalMix', 'valorMix'
             ]
@@ -1139,6 +1281,30 @@ def main():
             st.rerun()
         
         st.markdown("---")
+        st.header("📅 Intervalo dos Clicks (MovProdutos)")
+        intervalo_clicks = st.date_input(
+            "Selecione o intervalo customizado:",
+            value=(datetime.now().date(), datetime.now().date()),
+            key="intervalo_clicks_movprodutos",
+            help="Esse período é usado apenas para consultar a quantidade de clicks da loja."
+        )
+
+        data_inicio_clicks = None
+        data_fim_clicks = None
+        if isinstance(intervalo_clicks, tuple) and len(intervalo_clicks) == 2:
+            data_inicio_clicks, data_fim_clicks = intervalo_clicks
+        elif intervalo_clicks:
+            data_inicio_clicks = intervalo_clicks
+            data_fim_clicks = intervalo_clicks
+        if data_inicio_clicks and data_fim_clicks and data_inicio_clicks > data_fim_clicks:
+            data_inicio_clicks, data_fim_clicks = data_fim_clicks, data_inicio_clicks
+
+        st.caption(
+            f"Período aplicado nos clicks: "
+            f"{data_inicio_clicks.strftime('%d/%m/%Y') if data_inicio_clicks else '-'} até "
+            f"{data_fim_clicks.strftime('%d/%m/%Y') if data_fim_clicks else '-'}"
+        )
+        st.markdown("---")
         
         # Filtro de marcas
         st.header("🏪 Filtrar por Marca")
@@ -1169,7 +1335,12 @@ def main():
             df_marca = carregar_dados_marca(marca)
             if not df_marca.empty:
                 with st.spinner(f"Consultando clicks em tempo real ({marca})..."):
-                    df_marca = enriquecer_clicks_promocoes_rede_tempo_real(df_marca, marca)
+                    df_marca = enriquecer_clicks_promocoes_rede_tempo_real(
+                        df_marca,
+                        marca,
+                        data_inicio=data_inicio_clicks,
+                        data_fim=data_fim_clicks
+                    )
                 todos_dados.append(df_marca)
     
     if not todos_dados:
