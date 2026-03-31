@@ -124,6 +124,120 @@ def _extrair_sequencia_promocao(row, nome_grupo):
     sequencia = row.get("sequencia", None)
     return sequencia if sequencia not in ("", "None") else None
 
+def _normalizar_codigo_produto(valor):
+    """Normaliza código de produto para cruzar dados entre APIs."""
+    if pd.isna(valor):
+        return ""
+    texto = str(valor).strip()
+    if texto.endswith(".0"):
+        texto = texto[:-2]
+    return texto.replace(".", "").replace(",", "").replace(" ", "")
+
+def _extrair_lista_resposta_financeiro(dados):
+    """Extrai lista de itens da resposta da API de movimentação de produtos."""
+    if isinstance(dados, list):
+        return dados
+    if isinstance(dados, dict):
+        for chave in ("data", "itens", "items", "resultado", "content", "movimentos", "produtos"):
+            valor = dados.get(chave)
+            if isinstance(valor, list):
+                return valor
+    return []
+
+def _eh_promocoes_rede(nome_grupo):
+    return "PROMOCOES REDE" in _normalizar_grupo(nome_grupo)
+
+def enriquecer_utilizacao_promocoes_rede(df_marca, marca):
+    """
+    Preenche a quantidade de utilização por produto para promoções do grupo PROMOÇÕES REDE.
+    Usa a API /api/financeiro/movimentacao-produtos.
+    """
+    if df_marca.empty:
+        return df_marca
+
+    df_resultado = df_marca.copy()
+    if "quantidadeUtilizacaoProduto" not in df_resultado.columns:
+        df_resultado["quantidadeUtilizacaoProduto"] = 0
+
+    colunas_obrigatorias = {"nomeGrupo", "codigoLoja", "codigoProduto"}
+    if not colunas_obrigatorias.issubset(set(df_resultado.columns)):
+        return df_resultado
+
+    mask_rede = df_resultado["nomeGrupo"].apply(_eh_promocoes_rede)
+    if not mask_rede.any():
+        return df_resultado
+
+    config = MARCAS_CONFIG.get(marca, {})
+    codfranqueador = config.get("codfranqueador")
+    if not codfranqueador:
+        return df_resultado
+
+    token = autenticar(codfranqueador)
+    if not token:
+        return df_resultado
+
+    url_movimentacao_produtos = "https://lx-degust-api-integracao-prd.azurewebsites.net/api/financeiro/movimentacao-produtos"
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    cod_franqueador_str = str(codfranqueador)
+    mapa_utilizacao = {}
+
+    df_rede = df_resultado[mask_rede]
+    lojas = sorted(df_rede["codigoLoja"].dropna().unique().tolist())
+
+    for codigo_loja in lojas:
+        movimentos = []
+        bodies = [
+            {"codFranqueador": cod_franqueador_str, "codLoja": str(codigo_loja)},
+            {"codFranqueador": cod_franqueador_str, "codigoLoja": str(codigo_loja)},
+            {"codigoFranqueador": codfranqueador, "codigoLoja": codigo_loja},
+            {"codigoFranquia": codfranqueador, "codigoLoja": codigo_loja},
+        ]
+
+        for body in bodies:
+            try:
+                resp = requests.post(url_movimentacao_produtos, json=body, headers=headers, timeout=20)
+                if resp.status_code == 200:
+                    movimentos = _extrair_lista_resposta_financeiro(resp.json())
+                    if movimentos:
+                        break
+            except Exception:
+                continue
+
+        for mov in movimentos:
+            codigo_produto = (
+                mov.get("codProduto")
+                or mov.get("codigoProduto")
+                or mov.get("produto")
+                or mov.get("idProduto")
+                or mov.get("codigo")
+            )
+            codigo_norm = _normalizar_codigo_produto(codigo_produto)
+            if not codigo_norm:
+                continue
+
+            quantidade = (
+                mov.get("qtde")
+                or mov.get("quantidade")
+                or mov.get("qtd")
+                or mov.get("quantidadeUtilizada")
+                or mov.get("total")
+                or 0
+            )
+            try:
+                quantidade_float = float(quantidade)
+            except Exception:
+                quantidade_float = 0.0
+
+            chave = (str(codigo_loja), codigo_norm)
+            mapa_utilizacao[chave] = mapa_utilizacao.get(chave, 0.0) + quantidade_float
+
+    for idx, row in df_rede.iterrows():
+        codigo_loja = str(row.get("codigoLoja"))
+        codigo_norm = _normalizar_codigo_produto(row.get("codigoProduto"))
+        df_resultado.at[idx, "quantidadeUtilizacaoProduto"] = int(mapa_utilizacao.get((codigo_loja, codigo_norm), 0))
+
+    return df_resultado
+
 def autenticar(codfranqueador):
     """Realiza autenticação na API do Degust"""
     url_auth = "https://lx-degust-api-integracao-prd.azurewebsites.net/api/usuario/autenticar"
@@ -717,6 +831,7 @@ def agrupar_por_loja_e_promocao(df):
         produto = {
             'codigoProduto': row.get('codigoProduto', 'N/A'),
             'descricaoProduto': row.get('descricaoProduto', 'N/A'),
+            'quantidadeUtilizacaoProduto': row.get('quantidadeUtilizacaoProduto', 0),
             'produtoPromocaoAtivo': row.get('produtoPromocaoAtivo', 'N/A'),
             'domingo': row.get('domingo', 'N/A'),
             'segunda': row.get('segunda', 'N/A'),
@@ -894,7 +1009,7 @@ def exibir_promocao_dentro_loja(nome_promocao, dados_promocao, cor_marca):
             
             # Reordenar colunas para melhor visualização
             colunas_ordenadas = [
-                'codigoProduto', 'descricaoProduto',
+                'codigoProduto', 'descricaoProduto', 'quantidadeUtilizacaoProduto',
                 'domingo', 'segunda', 'terca', 'quarta', 'quinta', 'sexta', 'sabado', 'restricaoHorario',
                 'valorPromocionalMix', 'valorMix'
             ]
@@ -984,7 +1099,7 @@ def exibir_promocao_inativa_simples(nome_promocao, dados_promocao, cor_marca):
             
             # Reordenar colunas para melhor visualização
             colunas_ordenadas = [
-                'codigoProduto', 'descricaoProduto',
+                'codigoProduto', 'descricaoProduto', 'quantidadeUtilizacaoProduto',
                 'domingo', 'segunda', 'terca', 'quarta', 'quinta', 'sexta', 'sabado', 'restricaoHorario',
                 'valorPromocionalMix', 'valorMix'
             ]
@@ -1049,6 +1164,8 @@ def main():
         with st.spinner(f"Carregando dados de {marca}..."):
             df_marca = carregar_dados_marca(marca)
             if not df_marca.empty:
+                with st.spinner(f"Consultando movimentação de produtos ({marca})..."):
+                    df_marca = enriquecer_utilizacao_promocoes_rede(df_marca, marca)
                 todos_dados.append(df_marca)
     
     if not todos_dados:
