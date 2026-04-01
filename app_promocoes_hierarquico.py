@@ -1084,27 +1084,13 @@ def main():
             grupos_lojas = agrupar_por_loja_e_promocao(df_marca)
             
             # Informações da marca
-            col1, col2, col3, col4, col5 = st.columns(5)
+            col1, col2, col3 = st.columns(3)
             with col1:
                 st.metric("🏷️ Marcas", df_marca["marca"].nunique() if "marca" in df_marca.columns else 0)
             with col2:
                 st.metric("📦 Total de Lojas", len(grupos_lojas))
             with col3:
                 st.metric("📊 Total de Produtos", len(df_marca))
-            with col4:
-                st.metric("🏪 Lojas Únicas", df_marca["codigoLoja"].nunique() if "codigoLoja" in df_marca.columns else 0)
-            with col5:
-                if "nomeLoja" in df_marca.columns:
-                    lojas_nomes = df_marca["nomeLoja"].nunique()
-                    col4_1, col4_2 = st.columns([3, 1])
-                    with col4_1:
-                        st.metric("🏷️ Lojas com Nome", lojas_nomes)
-                    with col4_2:
-                        st.markdown("**Promoções de Rede**")
-                        if st.button("📊", help="Ver promoções por cobertura de lojas", key=f"btn_promocoes_{marca}", use_container_width=True):
-                            st.session_state[f'show_modal_{marca}'] = True
-                else:
-                    st.metric("🏷️ Lojas com Nome", 0)
             
             # Análise de Promoções de Rede
             if f'show_modal_{marca}' in st.session_state and st.session_state[f'show_modal_{marca}']:
