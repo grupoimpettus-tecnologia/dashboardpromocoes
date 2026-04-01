@@ -177,47 +177,31 @@ def enriquecer_utilizacao_promocoes_rede(df_marca, marca):
         return df_resultado
 
     url_movimentacao_produtos = "https://lx-degust-api-integracao-prd.azurewebsites.net/api/financeiro/movimentacao-produtos"
-    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    headers = {"Authorization": f"Bearer {token}"}
     cod_franqueador_str = str(codfranqueador)
+    data_caixa = datetime.now().strftime("%Y-%m-%d")
     mapa_utilizacao = {}
 
     df_rede = df_resultado[mask_rede]
     lojas = sorted(df_rede["codigoLoja"].dropna().unique().tolist())
 
-    for codigo_loja in lojas:
-        movimentos = []
-        bodies = [
-            {"codFranqueador": cod_franqueador_str, "codLoja": str(codigo_loja)},
-            {"codFranqueador": cod_franqueador_str, "codigoLoja": str(codigo_loja)},
-            {"codigoFranqueador": codfranqueador, "codigoLoja": codigo_loja},
-            {"codigoFranquia": codfranqueador, "codigoLoja": codigo_loja},
-        ]
-
-        for body in bodies:
-            try:
-                resp = requests.post(url_movimentacao_produtos, json=body, headers=headers, timeout=20)
-                if resp.status_code == 200:
-                    movimentos = _extrair_lista_resposta_financeiro(resp.json())
-                    if movimentos:
-                        break
-            except Exception:
-                continue
-
+    def acumular_movimentos(movimentos):
         for mov in movimentos:
+            codigo_loja_mov = mov.get("codigoLoja") or mov.get("codLoja")
             codigo_produto = (
-                mov.get("codProduto")
-                or mov.get("codigoProduto")
+                mov.get("codigoProduto")
+                or mov.get("codProduto")
                 or mov.get("produto")
                 or mov.get("idProduto")
                 or mov.get("codigo")
             )
             codigo_norm = _normalizar_codigo_produto(codigo_produto)
-            if not codigo_norm:
+            if not codigo_norm or codigo_loja_mov in (None, ""):
                 continue
 
             quantidade = (
-                mov.get("qtde")
-                or mov.get("quantidade")
+                mov.get("quantidade")
+                or mov.get("qtde")
                 or mov.get("qtd")
                 or mov.get("quantidadeUtilizada")
                 or mov.get("total")
@@ -228,8 +212,42 @@ def enriquecer_utilizacao_promocoes_rede(df_marca, marca):
             except Exception:
                 quantidade_float = 0.0
 
-            chave = (str(codigo_loja), codigo_norm)
+            chave = (str(codigo_loja_mov), codigo_norm)
             mapa_utilizacao[chave] = mapa_utilizacao.get(chave, 0.0) + quantidade_float
+
+    # API oficial: GET /api/financeiro/movimentacao-produtos com query params.
+    # DataCaixa representa o dia atual, então a quantidade é acumulada ate o momento da consulta.
+    if lojas:
+        params = {
+            "CodigoFranquia": cod_franqueador_str,
+            "CodigoLoja": ",".join(str(loja) for loja in lojas),
+            "DataCaixa": data_caixa,
+        }
+        movimentos = []
+        try:
+            resp = requests.get(url_movimentacao_produtos, params=params, headers=headers, timeout=30)
+            if resp.status_code == 200:
+                movimentos = _extrair_lista_resposta_financeiro(resp.json())
+        except Exception:
+            movimentos = []
+
+        if movimentos:
+            acumular_movimentos(movimentos)
+        else:
+            # Fallback por loja para cenarios em que a API nao aceita lista separada por virgula.
+            for codigo_loja in lojas:
+                params_loja = {
+                    "CodigoFranquia": cod_franqueador_str,
+                    "CodigoLoja": str(codigo_loja),
+                    "DataCaixa": data_caixa,
+                }
+                try:
+                    resp = requests.get(url_movimentacao_produtos, params=params_loja, headers=headers, timeout=20)
+                    if resp.status_code != 200:
+                        continue
+                    acumular_movimentos(_extrair_lista_resposta_financeiro(resp.json()))
+                except Exception:
+                    continue
 
     for idx, row in df_rede.iterrows():
         codigo_loja = str(row.get("codigoLoja"))
