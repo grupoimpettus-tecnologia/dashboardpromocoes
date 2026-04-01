@@ -1071,26 +1071,6 @@ def main():
         )
         st.markdown("---")
     
-    # Métricas gerais
-    col1, col2, col3, col4 = st.columns(4)
-    
-    with col1:
-        st.metric("📦 Total de Promoções", len(df_final))
-    
-    with col2:
-        lojas_unicas = df_final["codigoLoja"].nunique() if "codigoLoja" in df_final.columns else 0
-        st.metric("🏪 Lojas", lojas_unicas)
-    
-    with col3:
-        marcas_unicas = df_final["marca"].nunique() if "marca" in df_final.columns else 0
-        st.metric("🏷️ Marcas", marcas_unicas)
-    
-    with col4:
-        produtos_unicos = df_final["codigoProduto"].nunique() if "codigoProduto" in df_final.columns else 0
-        st.metric("🎯 Produtos Únicos", produtos_unicos)
-    
-    st.markdown("---")
-    
     # Exibir dados por marca no formato hierárquico
     for marca in marcas_selecionadas:
         df_marca = df_final[df_final["marca"] == marca] if "marca" in df_final.columns else pd.DataFrame()
@@ -1104,14 +1084,16 @@ def main():
             grupos_lojas = agrupar_por_loja_e_promocao(df_marca)
             
             # Informações da marca
-            col1, col2, col3, col4 = st.columns(4)
+            col1, col2, col3, col4, col5 = st.columns(5)
             with col1:
-                st.metric("📦 Total de Lojas", len(grupos_lojas))
+                st.metric("🏷️ Marcas", df_marca["marca"].nunique() if "marca" in df_marca.columns else 0)
             with col2:
-                st.metric("📊 Total de Produtos", len(df_marca))
+                st.metric("📦 Total de Lojas", len(grupos_lojas))
             with col3:
-                st.metric("🏪 Lojas Únicas", df_marca["codigoLoja"].nunique() if "codigoLoja" in df_marca.columns else 0)
+                st.metric("📊 Total de Produtos", len(df_marca))
             with col4:
+                st.metric("🏪 Lojas Únicas", df_marca["codigoLoja"].nunique() if "codigoLoja" in df_marca.columns else 0)
+            with col5:
                 if "nomeLoja" in df_marca.columns:
                     lojas_nomes = df_marca["nomeLoja"].nunique()
                     col4_1, col4_2 = st.columns([3, 1])
