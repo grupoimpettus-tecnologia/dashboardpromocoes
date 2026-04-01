@@ -2,6 +2,8 @@ import streamlit as st
 import requests
 import pandas as pd
 from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment
 from openpyxl.utils.dataframe import dataframe_to_rows
@@ -124,7 +126,7 @@ def _extrair_sequencia_promocao(row, nome_grupo):
     sequencia = row.get("sequencia", None)
     return sequencia if sequencia not in ("", "None") else None
 
-def autenticar(codfranqueador):
+def autenticar(codfranqueador, session=None):
     """Realiza autenticação na API do Degust"""
     url_auth = "https://lx-degust-api-integracao-prd.azurewebsites.net/api/usuario/autenticar"
     
@@ -133,9 +135,10 @@ def autenticar(codfranqueador):
         "senha": CREDENCIAIS["senha"],
         "codigoFranqueador": codfranqueador
     }
+    cliente_http = session or requests
     
     try:
-        response = requests.post(url_auth, json=credenciais, timeout=10)
+        response = cliente_http.post(url_auth, json=credenciais, timeout=10)
         if response.status_code == 200:
             token = response.json()["acesso"]["token"]
             return token
@@ -146,13 +149,14 @@ def autenticar(codfranqueador):
         st.error(f"❌ Erro de conexão: {str(e)}")
         return None
 
-def obter_lojas(token, codfranqueador):
+def obter_lojas(token, codfranqueador, session=None):
     """Obtém lista de lojas da franquia com dados completos"""
     url_lojas = f"https://lx-degust-api-integracao-prd.azurewebsites.net/api/loja/listarLojasFranquia?codigoFranquia={codfranqueador}"
     headers = {"Authorization": f"Bearer {token}"}
+    cliente_http = session or requests
     
     try:
-        response = requests.get(url_lojas, headers=headers, timeout=10)
+        response = cliente_http.get(url_lojas, headers=headers, timeout=10)
         if response.status_code == 200:
             lojas = response.json()
             return lojas
@@ -163,7 +167,7 @@ def obter_lojas(token, codfranqueador):
         st.error(f"❌ Erro de conexão: {str(e)}")
         return []
 
-def consultar_promocoes(token, codfranqueador, lojas_completas, marca):
+def consultar_promocoes(token, codfranqueador, lojas_completas, marca, max_workers=8):
     """Consulta promoções de todas as lojas"""
     url_promocoes = "https://lx-degust-api-integracao-prd.azurewebsites.net/api/produto/consultar-promocoes"
     headers = {
@@ -177,33 +181,54 @@ def consultar_promocoes(token, codfranqueador, lojas_completas, marca):
     status_text = st.empty()
     
     total_lojas = len(lojas_completas)
-    
-    for idx, loja in enumerate(lojas_completas):
+
+    if total_lojas == 0:
+        progress_bar.empty()
+        status_text.empty()
+        return dados_todas_lojas
+
+    workers = max(1, min(max_workers, total_lojas))
+    thread_local = threading.local()
+
+    def _session_thread():
+        if not hasattr(thread_local, "session"):
+            thread_local.session = requests.Session()
+        return thread_local.session
+
+    def _consultar_loja(loja):
         codigo_loja = loja["codigoLoja"]
         nome_loja = loja.get("nomeLoja", "N/A")
-        
-        status_text.text(f"🔄 Carregando promoções da loja {idx + 1}/{total_lojas}: {nome_loja}")
-        
         body = {
             "codigoFranquia": codfranqueador,
             "codigoLoja": codigo_loja
         }
-        
         try:
-            response = requests.post(url_promocoes, json=body, headers=headers, timeout=10)
-            
-            if response.status_code == 200:
-                dados = response.json()
-                if dados:
-                    for item in dados:
-                        item["codigoLoja"] = codigo_loja
-                        item["nomeLoja"] = nome_loja
-                        item["marca"] = marca
-                    dados_todas_lojas.extend(dados)
+            response = _session_thread().post(url_promocoes, json=body, headers=headers, timeout=10)
+            if response.status_code != 200:
+                return codigo_loja, nome_loja, []
+            dados = response.json() or []
+            for item in dados:
+                item["codigoLoja"] = codigo_loja
+                item["nomeLoja"] = nome_loja
+                item["marca"] = marca
+            return codigo_loja, nome_loja, dados
         except Exception as e:
-            st.warning(f"⚠️ Erro ao buscar promoções da loja {nome_loja} ({codigo_loja}): {str(e)}")
-        
-        progress_bar.progress((idx + 1) / total_lojas)
+            return codigo_loja, nome_loja, e
+
+    concluidas = 0
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futuros = [executor.submit(_consultar_loja, loja) for loja in lojas_completas]
+        for futuro in as_completed(futuros):
+            codigo_loja, nome_loja, resultado = futuro.result()
+            concluidas += 1
+            status_text.text(f"🔄 Carregando promoções ({concluidas}/{total_lojas}): {nome_loja}")
+            progress_bar.progress(concluidas / total_lojas)
+
+            if isinstance(resultado, Exception):
+                st.warning(f"⚠️ Erro ao buscar promoções da loja {nome_loja} ({codigo_loja}): {str(resultado)}")
+                continue
+            if resultado:
+                dados_todas_lojas.extend(resultado)
     
     progress_bar.empty()
     status_text.empty()
@@ -590,18 +615,19 @@ def carregar_dados_marca(marca):
         st.warning(f"⚠️ Código do franqueador não configurado para {marca}. Por favor, atualize o código em MARCAS_CONFIG.")
         return pd.DataFrame()
     
-    # Autenticar
-    token = autenticar(codfranqueador)
-    if not token:
-        return pd.DataFrame()
-    
-    # Obter lojas com dados completos
-    lojas_completas = obter_lojas(token, codfranqueador)
-    if not lojas_completas:
-        return pd.DataFrame()
-    
-    # Consultar promoções normais (API consultar-promocoes)
-    dados = consultar_promocoes(token, codfranqueador, lojas_completas, marca)
+    with requests.Session() as session:
+        # Autenticar
+        token = autenticar(codfranqueador, session=session)
+        if not token:
+            return pd.DataFrame()
+        
+        # Obter lojas com dados completos
+        lojas_completas = obter_lojas(token, codfranqueador, session=session)
+        if not lojas_completas:
+            return pd.DataFrame()
+        
+        # Consultar promoções normais (API consultar-promocoes)
+        dados = consultar_promocoes(token, codfranqueador, lojas_completas, marca)
     
     # Lógica de listar produtos das categorias "PROMOCAO" e "BALDES" (API grupo venda orientada) foi desativada.
     
