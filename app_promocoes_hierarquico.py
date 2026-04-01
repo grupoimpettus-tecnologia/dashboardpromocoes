@@ -133,6 +133,15 @@ def _normalizar_codigo_produto(valor):
         texto = texto[:-2]
     return texto.replace(".", "").replace(",", "").replace(" ", "")
 
+def _normalizar_codigo_loja(valor):
+    """Normaliza codigo da loja para formato consistente."""
+    if pd.isna(valor):
+        return ""
+    texto = str(valor).strip()
+    if texto.endswith(".0"):
+        texto = texto[:-2]
+    return texto.replace(" ", "")
+
 def _extrair_lista_resposta_financeiro(dados):
     """Extrai lista de itens da resposta da API de movimentação de produtos."""
     if isinstance(dados, list):
@@ -149,7 +158,7 @@ def _eh_promocoes_rede(nome_grupo):
 
 def enriquecer_utilizacao_promocoes_rede(df_marca, marca):
     """
-    Preenche a quantidade de utilização por produto para promoções do grupo PROMOÇÕES REDE.
+    Preenche a quantidade de utilização por produto ate o momento atual do dia.
     Usa a API /api/financeiro/movimentacao-produtos.
     """
     if df_marca.empty:
@@ -159,12 +168,8 @@ def enriquecer_utilizacao_promocoes_rede(df_marca, marca):
     if "quantidadeUtilizacaoProduto" not in df_resultado.columns:
         df_resultado["quantidadeUtilizacaoProduto"] = 0
 
-    colunas_obrigatorias = {"nomeGrupo", "codigoLoja", "codigoProduto"}
+    colunas_obrigatorias = {"codigoLoja", "codigoProduto"}
     if not colunas_obrigatorias.issubset(set(df_resultado.columns)):
-        return df_resultado
-
-    mask_rede = df_resultado["nomeGrupo"].apply(_eh_promocoes_rede)
-    if not mask_rede.any():
         return df_resultado
 
     config = MARCAS_CONFIG.get(marca, {})
@@ -182,8 +187,7 @@ def enriquecer_utilizacao_promocoes_rede(df_marca, marca):
     data_caixa = datetime.now().strftime("%Y-%m-%d")
     mapa_utilizacao = {}
 
-    df_rede = df_resultado[mask_rede]
-    lojas = sorted(df_rede["codigoLoja"].dropna().unique().tolist())
+    lojas = sorted(df_resultado["codigoLoja"].dropna().unique().tolist())
 
     def acumular_movimentos(movimentos):
         for mov in movimentos:
@@ -212,7 +216,7 @@ def enriquecer_utilizacao_promocoes_rede(df_marca, marca):
             except Exception:
                 quantidade_float = 0.0
 
-            chave = (str(codigo_loja_mov), codigo_norm)
+            chave = (_normalizar_codigo_loja(codigo_loja_mov), codigo_norm)
             mapa_utilizacao[chave] = mapa_utilizacao.get(chave, 0.0) + quantidade_float
 
     # API oficial: GET /api/financeiro/movimentacao-produtos com query params.
@@ -249,8 +253,8 @@ def enriquecer_utilizacao_promocoes_rede(df_marca, marca):
                 except Exception:
                     continue
 
-    for idx, row in df_rede.iterrows():
-        codigo_loja = str(row.get("codigoLoja"))
+    for idx, row in df_resultado.iterrows():
+        codigo_loja = _normalizar_codigo_loja(row.get("codigoLoja"))
         codigo_norm = _normalizar_codigo_produto(row.get("codigoProduto"))
         df_resultado.at[idx, "quantidadeUtilizacaoProduto"] = int(mapa_utilizacao.get((codigo_loja, codigo_norm), 0))
 
