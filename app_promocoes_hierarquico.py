@@ -1176,36 +1176,28 @@ def main():
             
             st.markdown("---")
             
-            # Inicializar variável de busca
-            busca_loja = ""
+            # Inicializar seleção de lojas para exibição
+            lojas_selecionadas_busca = []
             lojas_selecionadas_download = []
             
             # Campo de busca e seletor de lojas para download
             if "nomeLoja" in df_marca.columns and "codigoLoja" in df_marca.columns:
                 lojas_info = df_marca[["codigoLoja", "nomeLoja"]].drop_duplicates().sort_values("codigoLoja")
                 
-                # Campo de busca para filtrar lojas
-                st.markdown("**🔍 Buscar Lojas:**")
-                busca_loja = st.text_input(
-                    "Digite o nome ou código da loja para filtrar:",
-                    key=f"busca_loja_{marca}",
-                    placeholder="Ex: DOWNTOWN ou 1"
-                )
-                
-                # Filtrar lojas baseado na busca
-                if busca_loja:
-                    busca_lower = busca_loja.lower()
-                    lojas_filtradas = lojas_info[
-                        lojas_info["nomeLoja"].str.lower().str.contains(busca_lower, na=False) |
-                        lojas_info["codigoLoja"].astype(str).str.contains(busca_lower, na=False)
-                    ]
-                else:
-                    lojas_filtradas = lojas_info
-                
-                # Criar lista de lojas formatadas para o multiselect
+                # Criar lista de lojas formatadas para seleção
                 lojas_formatadas = []
-                for _, loja in lojas_filtradas.iterrows():
+                for _, loja in lojas_info.iterrows():
                     lojas_formatadas.append(f"{loja['codigoLoja']} - {loja['nomeLoja']}")
+
+                # Seletor de lojas para exibição (substitui busca por digitação)
+                st.markdown("**🔍 Buscar Lojas:**")
+                lojas_selecionadas_busca = st.multiselect(
+                    "Selecione as lojas para exibir (deixe vazio para exibir todas):",
+                    options=lojas_formatadas,
+                    default=[],
+                    key=f"busca_loja_{marca}",
+                    help="Seleção de lojas para filtrar a visualização na tela"
+                )
                 
                 # Seletor de lojas para download
                 st.markdown("**📥 Selecionar Lojas para Download:**")
@@ -1261,11 +1253,11 @@ def main():
                 
                 # Filtrar lojas a serem exibidas se houver busca
                 grupos_lojas_filtrados = grupos_lojas.copy()
-                if busca_loja and "nomeLoja" in df_marca.columns and "codigoLoja" in df_marca.columns:
-                    busca_lower = busca_loja.lower()
+                if lojas_selecionadas_busca and "nomeLoja" in df_marca.columns and "codigoLoja" in df_marca.columns:
+                    lojas_escolhidas_set = set(lojas_selecionadas_busca)
                     grupos_lojas_filtrados = {
                         chave: dados for chave, dados in grupos_lojas.items()
-                        if busca_lower in chave.lower()
+                        if chave in lojas_escolhidas_set
                     }
                 
                 for chave_loja, dados_loja in grupos_lojas_filtrados.items():
