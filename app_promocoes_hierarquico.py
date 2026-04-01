@@ -124,142 +124,6 @@ def _extrair_sequencia_promocao(row, nome_grupo):
     sequencia = row.get("sequencia", None)
     return sequencia if sequencia not in ("", "None") else None
 
-def _normalizar_codigo_produto(valor):
-    """Normaliza código de produto para cruzar dados entre APIs."""
-    if pd.isna(valor):
-        return ""
-    texto = str(valor).strip()
-    if texto.endswith(".0"):
-        texto = texto[:-2]
-    return texto.replace(".", "").replace(",", "").replace(" ", "")
-
-def _normalizar_codigo_loja(valor):
-    """Normaliza codigo da loja para formato consistente."""
-    if pd.isna(valor):
-        return ""
-    texto = str(valor).strip()
-    if texto.endswith(".0"):
-        texto = texto[:-2]
-    return texto.replace(" ", "")
-
-def _extrair_lista_resposta_financeiro(dados):
-    """Extrai lista de itens da resposta da API de movimentação de produtos."""
-    if isinstance(dados, list):
-        return dados
-    if isinstance(dados, dict):
-        for chave in ("data", "itens", "items", "resultado", "content", "movimentos", "produtos"):
-            valor = dados.get(chave)
-            if isinstance(valor, list):
-                return valor
-    return []
-
-def _eh_promocoes_rede(nome_grupo):
-    return "PROMOCOES REDE" in _normalizar_grupo(nome_grupo)
-
-def enriquecer_utilizacao_promocoes_rede(df_marca, marca):
-    """
-    Preenche a quantidade de utilização por produto ate o momento atual do dia.
-    Usa a API /api/financeiro/movimentacao-produtos.
-    """
-    if df_marca.empty:
-        return df_marca
-
-    df_resultado = df_marca.copy()
-    if "quantidadeUtilizacaoProduto" not in df_resultado.columns:
-        df_resultado["quantidadeUtilizacaoProduto"] = 0
-
-    colunas_obrigatorias = {"codigoLoja", "codigoProduto"}
-    if not colunas_obrigatorias.issubset(set(df_resultado.columns)):
-        return df_resultado
-
-    config = MARCAS_CONFIG.get(marca, {})
-    codfranqueador = config.get("codfranqueador")
-    if not codfranqueador:
-        return df_resultado
-
-    token = autenticar(codfranqueador)
-    if not token:
-        return df_resultado
-
-    url_movimentacao_produtos = "https://lx-degust-api-integracao-prd.azurewebsites.net/api/financeiro/movimentacao-produtos"
-    headers = {"Authorization": f"Bearer {token}"}
-    cod_franqueador_str = str(codfranqueador)
-    data_caixa = datetime.now().strftime("%Y-%m-%d")
-    mapa_utilizacao = {}
-
-    lojas = sorted(df_resultado["codigoLoja"].dropna().unique().tolist())
-
-    def acumular_movimentos(movimentos):
-        for mov in movimentos:
-            codigo_loja_mov = mov.get("codigoLoja") or mov.get("codLoja")
-            codigo_produto = (
-                mov.get("codigoProduto")
-                or mov.get("codProduto")
-                or mov.get("produto")
-                or mov.get("idProduto")
-                or mov.get("codigo")
-            )
-            codigo_norm = _normalizar_codigo_produto(codigo_produto)
-            if not codigo_norm or codigo_loja_mov in (None, ""):
-                continue
-
-            quantidade = (
-                mov.get("quantidade")
-                or mov.get("qtde")
-                or mov.get("qtd")
-                or mov.get("quantidadeUtilizada")
-                or mov.get("total")
-                or 0
-            )
-            try:
-                quantidade_float = float(quantidade)
-            except Exception:
-                quantidade_float = 0.0
-
-            chave = (_normalizar_codigo_loja(codigo_loja_mov), codigo_norm)
-            mapa_utilizacao[chave] = mapa_utilizacao.get(chave, 0.0) + quantidade_float
-
-    # API oficial: GET /api/financeiro/movimentacao-produtos com query params.
-    # DataCaixa representa o dia atual, então a quantidade é acumulada ate o momento da consulta.
-    if lojas:
-        params = {
-            "CodigoFranquia": cod_franqueador_str,
-            "CodigoLoja": ",".join(str(loja) for loja in lojas),
-            "DataCaixa": data_caixa,
-        }
-        movimentos = []
-        try:
-            resp = requests.get(url_movimentacao_produtos, params=params, headers=headers, timeout=30)
-            if resp.status_code == 200:
-                movimentos = _extrair_lista_resposta_financeiro(resp.json())
-        except Exception:
-            movimentos = []
-
-        if movimentos:
-            acumular_movimentos(movimentos)
-        else:
-            # Fallback por loja para cenarios em que a API nao aceita lista separada por virgula.
-            for codigo_loja in lojas:
-                params_loja = {
-                    "CodigoFranquia": cod_franqueador_str,
-                    "CodigoLoja": str(codigo_loja),
-                    "DataCaixa": data_caixa,
-                }
-                try:
-                    resp = requests.get(url_movimentacao_produtos, params=params_loja, headers=headers, timeout=20)
-                    if resp.status_code != 200:
-                        continue
-                    acumular_movimentos(_extrair_lista_resposta_financeiro(resp.json()))
-                except Exception:
-                    continue
-
-    for idx, row in df_resultado.iterrows():
-        codigo_loja = _normalizar_codigo_loja(row.get("codigoLoja"))
-        codigo_norm = _normalizar_codigo_produto(row.get("codigoProduto"))
-        df_resultado.at[idx, "quantidadeUtilizacaoProduto"] = int(mapa_utilizacao.get((codigo_loja, codigo_norm), 0))
-
-    return df_resultado
-
 def autenticar(codfranqueador):
     """Realiza autenticação na API do Degust"""
     url_auth = "https://lx-degust-api-integracao-prd.azurewebsites.net/api/usuario/autenticar"
@@ -853,7 +717,6 @@ def agrupar_por_loja_e_promocao(df):
         produto = {
             'codigoProduto': row.get('codigoProduto', 'N/A'),
             'descricaoProduto': row.get('descricaoProduto', 'N/A'),
-            'quantidadeUtilizacaoProduto': row.get('quantidadeUtilizacaoProduto', 0),
             'produtoPromocaoAtivo': row.get('produtoPromocaoAtivo', 'N/A'),
             'domingo': row.get('domingo', 'N/A'),
             'segunda': row.get('segunda', 'N/A'),
@@ -1031,7 +894,7 @@ def exibir_promocao_dentro_loja(nome_promocao, dados_promocao, cor_marca):
             
             # Reordenar colunas para melhor visualização
             colunas_ordenadas = [
-                'codigoProduto', 'descricaoProduto', 'quantidadeUtilizacaoProduto',
+                'codigoProduto', 'descricaoProduto',
                 'domingo', 'segunda', 'terca', 'quarta', 'quinta', 'sexta', 'sabado', 'restricaoHorario',
                 'valorPromocionalMix', 'valorMix'
             ]
@@ -1121,7 +984,7 @@ def exibir_promocao_inativa_simples(nome_promocao, dados_promocao, cor_marca):
             
             # Reordenar colunas para melhor visualização
             colunas_ordenadas = [
-                'codigoProduto', 'descricaoProduto', 'quantidadeUtilizacaoProduto',
+                'codigoProduto', 'descricaoProduto',
                 'domingo', 'segunda', 'terca', 'quarta', 'quinta', 'sexta', 'sabado', 'restricaoHorario',
                 'valorPromocionalMix', 'valorMix'
             ]
@@ -1186,8 +1049,6 @@ def main():
         with st.spinner(f"Carregando dados de {marca}..."):
             df_marca = carregar_dados_marca(marca)
             if not df_marca.empty:
-                with st.spinner(f"Consultando movimentação de produtos ({marca})..."):
-                    df_marca = enriquecer_utilizacao_promocoes_rede(df_marca, marca)
                 todos_dados.append(df_marca)
     
     if not todos_dados:
