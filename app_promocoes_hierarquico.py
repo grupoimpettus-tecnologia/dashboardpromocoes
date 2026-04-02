@@ -282,6 +282,17 @@ def montar_tabela_cliques_promocao_rede(codfranqueador, df_marca, nome_promocao,
 
     ordem = ["codigoLoja", "nomeLoja"] + col_labels + ["Acumulado (cliques)"]
     df_out = pd.DataFrame(list(rows_by_cod.values()))[ordem]
+    df_out = df_out.sort_values(
+        by="Acumulado (cliques)", ascending=False, ignore_index=True
+    )
+
+    # Linha de totais gerais (soma por coluna de período + acumulado).
+    linha_total = {"codigoLoja": "", "nomeLoja": "TOTAL"}
+    for lbl in col_labels:
+        linha_total[lbl] = float(df_out[lbl].sum())
+    linha_total["Acumulado (cliques)"] = float(df_out["Acumulado (cliques)"].sum())
+    df_out = pd.concat([df_out, pd.DataFrame([linha_total])], ignore_index=True)
+
     return df_out, None
 
 def _normalizar_grupo(valor):
