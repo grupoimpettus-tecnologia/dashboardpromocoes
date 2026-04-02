@@ -95,6 +95,15 @@ CREDENCIAIS = {
 DEGUST_API_BASE = "https://lx-degust-api-integracao-prd.azurewebsites.net"
 
 
+def _formatar_data_br(valor):
+    """Formata data para exibição: dd/mm/aaaa."""
+    if valor is None:
+        return ""
+    if isinstance(valor, date):
+        return valor.strftime("%d/%m/%Y")
+    return str(valor)
+
+
 def _eh_promocoes_rede(nome_grupo):
     return "PROMOCOES REDE" in _normalizar_grupo(nome_grupo)
 
@@ -226,7 +235,9 @@ def montar_tabela_cliques_promocao_rede(codfranqueador, df_marca, nome_promocao,
     if not blocos:
         return None, "Intervalo de datas inválido."
 
-    col_labels = [f"{a.strftime('%d/%m/%Y')} a {b.strftime('%d/%m/%Y')}" for a, b in blocos]
+    col_labels = [
+        f"{_formatar_data_br(a)} a {_formatar_data_br(b)}" for a, b in blocos
+    ]
 
     rows_by_cod = {}
     for _, r in lojas_df.iterrows():
@@ -1341,12 +1352,14 @@ def main():
                         d_ini_acao = st.date_input(
                             "Início da ação",
                             value=date.today() - timedelta(days=29),
+                            format="DD/MM/YYYY",
                             key=f"dini_acao_{marca}",
                         )
                     with c_b:
                         d_fim_analise = st.date_input(
                             "Último dia da análise",
                             value=date.today(),
+                            format="DD/MM/YYYY",
                             key=f"dfim_analise_{marca}",
                         )
                     with c_c:
@@ -1389,8 +1402,8 @@ def main():
                                 st.session_state[f"cliques_rede_df_{marca}"] = df_cliques
                                 st.session_state[f"cliques_rede_meta_{marca}"] = {
                                     "promocao": nome_sel,
-                                    "inicio": str(d_ini_acao),
-                                    "fim": str(d_fim_analise),
+                                    "inicio": _formatar_data_br(d_ini_acao),
+                                    "fim": _formatar_data_br(d_fim_analise),
                                 }
                                 st.success("Consulta concluída.")
                             else:
@@ -1402,7 +1415,7 @@ def main():
                         if meta:
                             st.caption(
                                 f"Última consulta: **{meta.get('promocao', '')}** — "
-                                f"{meta.get('inicio', '')} → {meta.get('fim', '')}"
+                                f"{meta.get('inicio', '')} a {meta.get('fim', '')}"
                             )
                         st.dataframe(st.session_state[chave_df], use_container_width=True)
                         buf = io.BytesIO()
