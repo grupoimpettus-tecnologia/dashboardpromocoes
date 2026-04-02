@@ -1,7 +1,7 @@
 import streamlit as st
 import requests
 import pandas as pd
-from datetime import datetime
+from datetime import datetime, date, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
 from openpyxl import Workbook
@@ -91,6 +91,198 @@ CREDENCIAIS = {
     "usuario": "06266555794",
     "senha": "250913"
 }
+
+DEGUST_API_BASE = "https://lx-degust-api-integracao-prd.azurewebsites.net"
+
+
+def _eh_promocoes_rede(nome_grupo):
+    return "PROMOCOES REDE" in _normalizar_grupo(nome_grupo)
+
+
+def listar_nomes_promocao_rede(df_marca):
+    """Lista nomePromocao distintos onde o grupo é PROMOÇÕES REDE."""
+    if df_marca.empty or "nomeGrupo" not in df_marca.columns:
+        return []
+    sub = df_marca[df_marca["nomeGrupo"].apply(_eh_promocoes_rede)]
+    if sub.empty or "nomePromocao" not in sub.columns:
+        return []
+    return sorted(sub["nomePromocao"].dropna().astype(str).unique().tolist())
+
+
+def codigos_produtos_promocao_rede(df_marca, nome_promocao):
+    """Códigos de produto agregados da ação: PROMOÇÕES REDE + nomePromocao."""
+    if df_marca.empty:
+        return set()
+    mask = (
+        df_marca["nomeGrupo"].apply(_eh_promocoes_rede)
+        & (df_marca["nomePromocao"].astype(str) == str(nome_promocao))
+    )
+    if "codigoProduto" not in df_marca.columns:
+        return set()
+    cods = df_marca.loc[mask, "codigoProduto"].dropna().unique()
+    out = set()
+    for c in cods:
+        try:
+            out.add(int(float(c)))
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def gerar_blocos_30_dias(data_inicio, data_fim):
+    """
+    Parte o intervalo em blocos de até 30 dias (API relatorio-vendas).
+    Cada bloco: [início, fim] inclusive, no máximo 30 dias corridos.
+    """
+    if data_fim < data_inicio:
+        return []
+    blocos = []
+    cur = data_inicio
+    while cur <= data_fim:
+        fim_bloco = min(cur + timedelta(days=29), data_fim)
+        blocos.append((cur, fim_bloco))
+        cur = fim_bloco + timedelta(days=1)
+    return blocos
+
+
+def _venda_nao_cancelada(venda):
+    c = venda.get("cancelada")
+    if c is None or c == "":
+        return True
+    return str(c).upper() not in ("S", "SIM", "1", "Y", "YES", "TRUE")
+
+
+def _item_conta_para_clique(item):
+    c = item.get("cancelado")
+    if c is None or c == "":
+        return True
+    return str(c).upper() not in ("S", "SIM", "1", "Y", "YES", "TRUE")
+
+
+def somar_cliques_em_vendas(vendas, produtos_set):
+    """Soma quantidade dos itens cujo codProduto está em produtos_set (clique = venda)."""
+    total = 0.0
+    for v in vendas or []:
+        if not _venda_nao_cancelada(v):
+            continue
+        for it in v.get("itens") or []:
+            if not _item_conta_para_clique(it):
+                continue
+            cod = it.get("codProduto")
+            if cod is None:
+                continue
+            try:
+                c = int(cod)
+            except (TypeError, ValueError):
+                continue
+            if c not in produtos_set:
+                continue
+            q = it.get("quantidade")
+            try:
+                total += float(q or 0)
+            except (TypeError, ValueError):
+                pass
+    return total
+
+
+def consultar_relatorio_vendas_sum(session, token, cod_franqueador, cod_loja, d_ini, d_fim, produtos_set):
+    """POST /api/venda/relatorio-vendas — retorna soma de cliques ou None se falhar."""
+    url = f"{DEGUST_API_BASE}/api/venda/relatorio-vendas"
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    body = {
+        "codFranqueador": int(cod_franqueador),
+        "codLoja": int(cod_loja),
+        "dataInicial": d_ini.isoformat(),
+        "dataFinal": d_fim.isoformat(),
+        "tipoData": "C",
+        "exibirVendasCanceladas": False,
+    }
+    try:
+        r = session.post(url, json=body, headers=headers, timeout=120)
+        if r.status_code != 200:
+            return None
+        vendas = r.json()
+        if not isinstance(vendas, list):
+            return None
+        return somar_cliques_em_vendas(vendas, produtos_set)
+    except Exception:
+        return None
+
+
+def montar_tabela_cliques_promocao_rede(codfranqueador, df_marca, nome_promocao, data_inicio, data_fim, max_workers=6, progress_bar=None, status_label=None):
+    """
+    Por loja: colunas = um bloco de até 30 dias cada + Acumulado (cliques).
+    Retorna (DataFrame, mensagem_erro). mensagem_erro só se falha grosseira.
+    """
+    produtos_set = codigos_produtos_promocao_rede(df_marca, nome_promocao)
+    if not produtos_set:
+        return None, "Nenhum produto encontrado para essa promoção em PROMOÇÕES REDE."
+
+    if "codigoLoja" not in df_marca.columns or "nomeLoja" not in df_marca.columns:
+        return None, "DataFrame sem codigoLoja ou nomeLoja."
+
+    lojas_df = df_marca[["codigoLoja", "nomeLoja"]].drop_duplicates().sort_values("codigoLoja")
+    blocos = gerar_blocos_30_dias(data_inicio, data_fim)
+    if not blocos:
+        return None, "Intervalo de datas inválido."
+
+    col_labels = [f"{a.strftime('%d/%m/%Y')} a {b.strftime('%d/%m/%Y')}" for a, b in blocos]
+
+    rows_by_cod = {}
+    for _, r in lojas_df.iterrows():
+        cod_loja_row = int(r["codigoLoja"])
+        rows_by_cod[cod_loja_row] = {"codigoLoja": cod_loja_row, "nomeLoja": r.get("nomeLoja", "N/A")}
+        for lbl in col_labels:
+            rows_by_cod[cod_loja_row][lbl] = 0.0
+
+    total_ops = len(blocos) * len(lojas_df)
+    done = 0
+    thread_local = threading.local()
+
+    def _sess():
+        if not hasattr(thread_local, "session"):
+            thread_local.session = requests.Session()
+        return thread_local.session
+
+    with requests.Session() as main_session:
+        token = autenticar(codfranqueador, session=main_session)
+        if not token:
+            return None, "Falha na autenticação."
+
+        for bidx, (di, df_end) in enumerate(blocos):
+            lbl = col_labels[bidx]
+
+            def _work(cod_loja):
+                loja_cod = int(cod_loja)
+                soma = consultar_relatorio_vendas_sum(
+                    _sess(), token, codfranqueador, loja_cod, di, df_end, produtos_set
+                )
+                return loja_cod, soma if soma is not None else 0.0
+
+            workers = max(1, min(max_workers, len(lojas_df)))
+            with ThreadPoolExecutor(max_workers=workers) as executor:
+                futs = [
+                    executor.submit(_work, r["codigoLoja"]) for _, r in lojas_df.iterrows()
+                ]
+                for fut in as_completed(futs):
+                    loja_cod, soma = fut.result()
+                    rows_by_cod[loja_cod][lbl] = soma
+                    done += 1
+                    if progress_bar is not None:
+                        progress_bar.progress(min(done / max(total_ops, 1), 1.0))
+                    if status_label is not None:
+                        status_label.text(
+                            f"Relatório de vendas: bloco {bidx + 1}/{len(blocos)} "
+                            f"({lbl}) — {done}/{total_ops}"
+                        )
+
+    for c in rows_by_cod:
+        acc = sum(rows_by_cod[c][lbl] for lbl in col_labels)
+        rows_by_cod[c]["Acumulado (cliques)"] = acc
+
+    ordem = ["codigoLoja", "nomeLoja"] + col_labels + ["Acumulado (cliques)"]
+    df_out = pd.DataFrame(list(rows_by_cod.values()))[ordem]
+    return df_out, None
 
 def _normalizar_grupo(valor):
     """Normaliza nome de grupo para comparação consistente."""
@@ -1118,6 +1310,102 @@ def main():
             with col3:
                 st.metric("📊 Total de Produtos", len(df_marca))
             
+            with st.expander("📈 Ações PROMOÇÕES REDE — cliques (vendas) por loja", expanded=False):
+                st.markdown(
+                    "**Clique** = quantidade vendida do item no relatório de vendas, "
+                    "agregada para todos os produtos da promoção selecionada em **PROMOÇÕES REDE**. "
+                    "Períodos respeitam blocos de até **30 dias** (limite da API)."
+                )
+                promos_rede = listar_nomes_promocao_rede(df_marca)
+                if not promos_rede:
+                    st.info("Não há promoções do grupo PROMOÇÕES REDE nos dados carregados para esta marca.")
+                else:
+                    nome_sel = st.selectbox(
+                        "Nome da promoção (nomePromocao)",
+                        promos_rede,
+                        key=f"sel_promo_rede_{marca}",
+                    )
+                    c_a, c_b, c_c = st.columns(3)
+                    with c_a:
+                        d_ini_acao = st.date_input(
+                            "Início da ação",
+                            value=date.today() - timedelta(days=29),
+                            key=f"dini_acao_{marca}",
+                        )
+                    with c_b:
+                        d_fim_analise = st.date_input(
+                            "Último dia da análise",
+                            value=date.today(),
+                            key=f"dfim_analise_{marca}",
+                        )
+                    with c_c:
+                        max_wr = st.number_input(
+                            "Paralelismo (lojas por bloco)",
+                            min_value=1,
+                            max_value=12,
+                            value=6,
+                            key=f"max_wr_cliques_{marca}",
+                        )
+
+                    n_prods = len(codigos_produtos_promocao_rede(df_marca, nome_sel))
+                    st.caption(f"Produtos agregados nesta ação: **{n_prods}** código(s).")
+
+                    if st.button(
+                        "Consultar cliques por loja e período",
+                        key=f"btn_cliques_rede_{marca}",
+                    ):
+                        if d_fim_analise < d_ini_acao:
+                            st.error("A data final deve ser maior ou igual à data de início da ação.")
+                        else:
+                            codfranqueador = MARCAS_CONFIG[marca]["codfranqueador"]
+                            prog = st.progress(0)
+                            status_txt = st.empty()
+                            df_cliques, err = montar_tabela_cliques_promocao_rede(
+                                codfranqueador,
+                                df_marca,
+                                nome_sel,
+                                d_ini_acao,
+                                d_fim_analise,
+                                max_workers=int(max_wr),
+                                progress_bar=prog,
+                                status_label=status_txt,
+                            )
+                            prog.empty()
+                            status_txt.empty()
+                            if err:
+                                st.error(err)
+                            elif df_cliques is not None and not df_cliques.empty:
+                                st.session_state[f"cliques_rede_df_{marca}"] = df_cliques
+                                st.session_state[f"cliques_rede_meta_{marca}"] = {
+                                    "promocao": nome_sel,
+                                    "inicio": str(d_ini_acao),
+                                    "fim": str(d_fim_analise),
+                                }
+                                st.success("Consulta concluída.")
+                            else:
+                                st.warning("Nenhum dado retornado.")
+
+                    chave_df = f"cliques_rede_df_{marca}"
+                    if chave_df in st.session_state and st.session_state[chave_df] is not None:
+                        meta = st.session_state.get(f"cliques_rede_meta_{marca}", {})
+                        if meta:
+                            st.caption(
+                                f"Última consulta: **{meta.get('promocao', '')}** — "
+                                f"{meta.get('inicio', '')} → {meta.get('fim', '')}"
+                            )
+                        st.dataframe(st.session_state[chave_df], use_container_width=True)
+                        buf = io.BytesIO()
+                        with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+                            st.session_state[chave_df].to_excel(writer, index=False, sheet_name="Cliques")
+                        buf.seek(0)
+                        st.download_button(
+                            label="⬇️ Baixar tabela de cliques (Excel)",
+                            data=buf,
+                            file_name=f"cliques_rede_{marca.replace(' ', '_')}_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
+                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                            key=f"dl_cliques_rede_{marca}",
+                        )
+
             # Análise de Promoções de Rede
             if f'show_modal_{marca}' in st.session_state and st.session_state[f'show_modal_{marca}']:
                 with st.expander(f"📊 Promoções de Rede - {marca}", expanded=True):
