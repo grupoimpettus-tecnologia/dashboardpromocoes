@@ -103,6 +103,16 @@ def _formatar_data_br(valor):
         return valor.strftime("%d/%m/%Y")
     return str(valor)
 
+def _agora_brasilia_str(fmt="%d/%m/%Y %H:%M:%S"):
+    """Data/hora atual em Brasília (America/Sao_Paulo) para exibição."""
+    try:
+        from zoneinfo import ZoneInfo
+        return datetime.now(ZoneInfo("America/Sao_Paulo")).strftime(fmt)
+    except Exception:
+        from datetime import timezone
+        return datetime.now(timezone(timedelta(hours=-3))).strftime(fmt)
+
+
 
 def _eh_promocoes_rede(nome_grupo):
     return "PROMOCOES REDE" in _normalizar_grupo(nome_grupo)
@@ -1395,7 +1405,7 @@ def main():
                     marcas_selecionadas.append(marca)
         
         st.markdown("---")
-        st.markdown(f"**📅 Última atualização:**  \n{datetime.now().strftime('%d/%m/%Y %H:%M:%S')}")
+        st.markdown(f"**📅 Última atualização:**  \n{_agora_brasilia_str()}")
     
     # Carregar e exibir dados
     if not marcas_selecionadas:
@@ -1539,7 +1549,7 @@ def main():
                                     "promocao": nome_sel,
                                     "inicio": _formatar_data_br(d_ini_acao),
                                     "fim": _formatar_data_br(d_fim_analise),
-                                    "gerado_em": datetime.now().strftime("%d/%m/%Y %H:%M:%S"),
+                                    "gerado_em": _agora_brasilia_str(),
                                 }
                                 st.success("Consulta concluída.")
                             else:
