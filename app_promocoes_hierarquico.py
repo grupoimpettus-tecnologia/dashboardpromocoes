@@ -1475,9 +1475,9 @@ def main():
                         )
                     with c_c:
                         max_wr = st.number_input(
-                            "Paralelismo (lojas por bloco)",
+                            "Qtda de consultas por loja ao mesmo tempo (Limite 6)",
                             min_value=1,
-                            max_value=12,
+                            max_value=6,
                             value=6,
                             key=f"max_wr_cliques_{marca}",
                         )
