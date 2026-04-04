@@ -1,7 +1,12 @@
 import streamlit as st
 import requests
 import pandas as pd
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
+
+DEGUST_API_BASE = "https://lx-degust-api-integracao-prd.azurewebsites.net"
+
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment
 from openpyxl.utils.dataframe import dataframe_to_rows
@@ -92,8 +97,7 @@ def autenticar(codfranqueador):
 
 def _loja_degust_ativa(loja):
     """
-    listarLojasFranquia retorna LojasFranquiaResult com situacao e situacaoLoja (Swagger Degust).
-    Lojas inativas na retaguarda não entram no dashboard.
+    Fallback quando GET /api/loja/loja nao retorna dadosGerais.ativo de forma conclusiva.
     """
     for key in ("situacaoLoja", "situacao"):
         val = loja.get(key)
@@ -104,9 +108,92 @@ def _loja_degust_ativa(loja):
             return False
     return True
 
+
+def _interpretar_campo_ativo_cadastro(val):
+    if val is None:
+        return None
+    if isinstance(val, bool):
+        return val
+    s = str(val).strip().upper()
+    if not s:
+        return None
+    if s in ("S", "SIM", "1", "T", "TRUE", "Y", "YES", "ATIVO", "ATIVA"):
+        return True
+    if s in ("N", "NAO", "NÃO", "0", "F", "FALSE", "INATIVO", "INATIVA"):
+        return False
+    if "INATIV" in s:
+        return False
+    if "ATIV" in s:
+        return True
+    return None
+
+
+def _consultar_ativo_cadastro_loja(cliente_http, token, codfranqueador, codigo_loja):
+    url = f"{DEGUST_API_BASE}/api/loja/loja"
+    params = {"CodigoFranqueador": int(codfranqueador), "CodigoLoja": int(codigo_loja)}
+    headers = {"Authorization": f"Bearer {token}"}
+    try:
+        r = cliente_http.get(url, params=params, headers=headers, timeout=15)
+        if r.status_code != 200:
+            return None
+        data = r.json()
+        if not isinstance(data, dict):
+            return None
+        dg = data.get("dadosGerais") or {}
+        if not isinstance(dg, dict):
+            return None
+        return _interpretar_campo_ativo_cadastro(dg.get("ativo"))
+    except Exception:
+        return None
+
+
+def _manter_loja_apos_consulta_cadastro(loja, ativo_cadastro):
+    if ativo_cadastro is False:
+        return False
+    if ativo_cadastro is True:
+        return True
+    return _loja_degust_ativa(loja)
+
+
+def _filtrar_lojas_por_cadastro_degust(lojas, token, codfranqueador, max_workers=8):
+    if not lojas:
+        return []
+
+    def processar(loja, http):
+        cod = loja.get("codigoLoja")
+        try:
+            c = int(cod) if cod is not None else None
+        except (TypeError, ValueError):
+            c = None
+        if c is None:
+            return _manter_loja_apos_consulta_cadastro(loja, None)
+        at = _consultar_ativo_cadastro_loja(http, token, codfranqueador, c)
+        return _manter_loja_apos_consulta_cadastro(loja, at)
+
+    if len(lojas) == 1:
+        loja = lojas[0]
+        return [loja] if processar(loja, requests) else []
+
+    thread_local = threading.local()
+
+    def http_por_thread():
+        if not hasattr(thread_local, "session"):
+            thread_local.session = requests.Session()
+        return thread_local.session
+
+    workers = max(1, min(max_workers, len(lojas)))
+
+    def work(loja):
+        return loja, processar(loja, http_por_thread())
+
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        pairs = list(executor.map(work, lojas))
+    return [loja for loja, ok in pairs if ok]
+
+
 def obter_lojas(token, codfranqueador):
     """Obtém lista de lojas da franquia com dados completos"""
-    url_lojas = f"https://lx-degust-api-integracao-prd.azurewebsites.net/api/loja/listarLojasFranquia?codigoFranquia={codfranqueador}"
+    url_lojas = f"{DEGUST_API_BASE}/api/loja/listarLojasFranquia?codigoFranquia={codfranqueador}"
     headers = {"Authorization": f"Bearer {token}"}
     
     try:
@@ -115,7 +202,7 @@ def obter_lojas(token, codfranqueador):
             lojas = response.json()
             if not isinstance(lojas, list):
                 return []
-            return [l for l in lojas if _loja_degust_ativa(l)]
+            return _filtrar_lojas_por_cadastro_degust(lojas, token, codfranqueador)
         else:
             st.error(f"❌ Erro ao buscar lojas: {response.status_code}")
             return []
