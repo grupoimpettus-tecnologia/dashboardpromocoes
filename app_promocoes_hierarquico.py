@@ -363,6 +363,20 @@ def autenticar(codfranqueador, session=None):
         st.error(f"❌ Erro de conexão: {str(e)}")
         return None
 
+def _loja_degust_ativa(loja):
+    """
+    listarLojasFranquia retorna LojasFranquiaResult com situacao e situacaoLoja (Swagger Degust).
+    Lojas inativas na retaguarda não entram no dashboard.
+    """
+    for key in ("situacaoLoja", "situacao"):
+        val = loja.get(key)
+        if val is None:
+            continue
+        s = str(val).strip().upper()
+        if s and "INATIV" in s:
+            return False
+    return True
+
 def obter_lojas(token, codfranqueador, session=None):
     """Obtém lista de lojas da franquia com dados completos"""
     url_lojas = f"https://lx-degust-api-integracao-prd.azurewebsites.net/api/loja/listarLojasFranquia?codigoFranquia={codfranqueador}"
@@ -373,7 +387,9 @@ def obter_lojas(token, codfranqueador, session=None):
         response = cliente_http.get(url_lojas, headers=headers, timeout=10)
         if response.status_code == 200:
             lojas = response.json()
-            return lojas
+            if not isinstance(lojas, list):
+                return []
+            return [l for l in lojas if _loja_degust_ativa(l)]
         else:
             st.error(f"❌ Erro ao buscar lojas: {response.status_code}")
             return []
