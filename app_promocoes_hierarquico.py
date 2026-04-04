@@ -306,6 +306,13 @@ def montar_tabela_cliques_promocao_rede(codfranqueador, df_marca, nome_promocao,
 
     return df_out, None
 
+def _session_flag_true_callback(flag_key: str):
+    """on_click do Streamlit: define flag antes do rerun (evita expander fechado no mobile)."""
+    def _on_click():
+        st.session_state[flag_key] = True
+    return _on_click
+
+
 def _normalizar_grupo(valor):
     """Normaliza nome de grupo para comparação consistente."""
     texto = str(valor or "").strip().upper()
@@ -1444,7 +1451,19 @@ def main():
             with col3:
                 st.metric("📊 Total de Produtos", len(df_marca))
             
-            with st.expander("📈 AÇÕES PROMOÇÕES DE REDE - Cliques (Vendas) por loja", expanded=False):
+            _exp_cliques_key = f"ui_exp_cliques_rede_{marca}"
+            _chave_df_cliques = f"cliques_rede_df_{marca}"
+            _exp_cliques_aberto = (
+                st.session_state.get(_exp_cliques_key, False)
+                or (
+                    _chave_df_cliques in st.session_state
+                    and st.session_state.get(_chave_df_cliques) is not None
+                )
+            )
+            with st.expander(
+                "📈 AÇÕES PROMOÇÕES DE REDE - Cliques (Vendas) por loja",
+                expanded=_exp_cliques_aberto,
+            ):
                 st.markdown(
                     "Clique = Quantidade vendida do item no relatório de vendas e apenas produtos classificados como PROMOÇÕES DE REDE."
                 )
@@ -1488,6 +1507,8 @@ def main():
                     if st.button(
                         "Consultar cliques por loja e período",
                         key=f"btn_cliques_rede_{marca}",
+                        on_click=_session_flag_true_callback(_exp_cliques_key),
+                        use_container_width=True,
                     ):
                         if d_fim_analise < d_ini_acao:
                             st.error("A data final deve ser maior ou igual à data de início da ação.")
@@ -1495,16 +1516,19 @@ def main():
                             codfranqueador = MARCAS_CONFIG[marca]["codfranqueador"]
                             prog = st.progress(0)
                             status_txt = st.empty()
-                            df_cliques, err = montar_tabela_cliques_promocao_rede(
-                                codfranqueador,
-                                df_marca,
-                                nome_sel,
-                                d_ini_acao,
-                                d_fim_analise,
-                                max_workers=int(max_wr),
-                                progress_bar=prog,
-                                status_label=status_txt,
-                            )
+                            with st.spinner(
+                                "Consultando relatório de vendas por loja (pode levar alguns minutos)…"
+                            ):
+                                df_cliques, err = montar_tabela_cliques_promocao_rede(
+                                    codfranqueador,
+                                    df_marca,
+                                    nome_sel,
+                                    d_ini_acao,
+                                    d_fim_analise,
+                                    max_workers=int(max_wr),
+                                    progress_bar=prog,
+                                    status_label=status_txt,
+                                )
                             prog.empty()
                             status_txt.empty()
                             if err:
