@@ -1507,7 +1507,7 @@ def main():
                             "Qtda de consultas por loja ao mesmo tempo (Limite 6)",
                             min_value=1,
                             max_value=6,
-                            value=6,
+                            value=2,
                             key=f"max_wr_cliques_{marca}",
                         )
 
