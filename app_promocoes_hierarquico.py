@@ -1539,6 +1539,7 @@ def main():
                                     "promocao": nome_sel,
                                     "inicio": _formatar_data_br(d_ini_acao),
                                     "fim": _formatar_data_br(d_fim_analise),
+                                    "gerado_em": datetime.now().strftime("%d/%m/%Y %H:%M:%S"),
                                 }
                                 st.success("Consulta concluída.")
                             else:
@@ -1548,11 +1549,34 @@ def main():
                     if chave_df in st.session_state and st.session_state[chave_df] is not None:
                         meta = st.session_state.get(f"cliques_rede_meta_{marca}", {})
                         if meta:
+                            _ge = meta.get("gerado_em")
+                            _suf = f" · Consulta gerada em {_ge}" if _ge else ""
                             st.caption(
                                 f"Última consulta: **{meta.get('promocao', '')}** — "
-                                f"{meta.get('inicio', '')} a {meta.get('fim', '')}"
+                                f"{meta.get('inicio', '')} a {meta.get('fim', '')}{_suf}"
                             )
-                        st.dataframe(st.session_state[chave_df], use_container_width=True)
+                        _df_cliq = st.session_state[chave_df].copy()
+                        _rank = _df_cliq[_df_cliq["nomeLoja"].astype(str) != "TOTAL"]
+                        _top_loja = None
+                        if (
+                            not _rank.empty
+                            and "Acumulado (cliques)" in _rank.columns
+                            and "nomeLoja" in _rank.columns
+                        ):
+                            _acc = pd.to_numeric(
+                                _rank["Acumulado (cliques)"], errors="coerce"
+                            ).fillna(0)
+                            _top_loja = str(_rank.loc[_acc.idxmax(), "nomeLoja"])
+                        if _top_loja:
+                            st.markdown(
+                                f"Loja com mais aderência na ação até o momento: **{_top_loja}** 🏆"
+                            )
+                        _cols_show = [c for c in _df_cliq.columns if c != "codigoLoja"]
+                        st.dataframe(
+                            _df_cliq[_cols_show],
+                            use_container_width=True,
+                            hide_index=True,
+                        )
                         buf = io.BytesIO()
                         with pd.ExcelWriter(buf, engine="openpyxl") as writer:
                             st.session_state[chave_df].to_excel(writer, index=False, sheet_name="Cliques")
