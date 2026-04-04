@@ -1444,18 +1444,17 @@ def main():
             with col3:
                 st.metric("📊 Total de Produtos", len(df_marca))
             
-            with st.expander("📈 Ações PROMOÇÕES REDE — cliques (vendas) por loja", expanded=False):
+            with st.expander("📈 AÇÕES PROMOÇÕES DE REDE - Cliques (Vendas) por loja", expanded=False):
                 st.markdown(
-                    "**Clique** = quantidade vendida do item no relatório de vendas, "
-                    "agregada para todos os produtos da promoção selecionada em **PROMOÇÕES REDE**. "
-                    "Períodos respeitam blocos de até **30 dias** (limite da API)."
+                    "Clique = Quantidade vendida do item no relatório de vendas e apenas produtos classificados como PROMOÇÕES DE REDE."
                 )
+                st.caption("Períodos respeitam blocos de até **30 dias** (limite da API).")
                 promos_rede = listar_nomes_promocao_rede(df_marca)
                 if not promos_rede:
                     st.info("Não há promoções do grupo PROMOÇÕES REDE nos dados carregados para esta marca.")
                 else:
                     nome_sel = st.selectbox(
-                        "Nome da promoção (nomePromocao)",
+                        "Nome da promoção",
                         promos_rede,
                         key=f"sel_promo_rede_{marca}",
                     )
