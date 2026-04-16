@@ -1376,15 +1376,7 @@ def exibir_promocao_inativa_simples(nome_promocao, dados_promocao, cor_marca):
 def main():
     # Título
     st.title("⚡ Dashboard de Promoções")
-    st.markdown(
-        "<div style='text-align: center;'><strong>Marcas Grupo Impettus Degust = Espetto Carioca, Mané, Buteco Seu Rufino & Bendito</strong></div>",
-        unsafe_allow_html=True,
-    )
-    st.image(
-        "assets/logo-impettus.png",
-        use_column_width=False,
-        width=250,
-    )
+    st.markdown("<div style='text-align: center;'><strong>Marcas Grupo Impettus Degust = Espetto Carioca, Mané, Buteco Seu Rufino & Bendito</strong></div>", unsafe_allow_html=True)
     st.markdown("---")
     
     # Sidebar com filtros e controles
