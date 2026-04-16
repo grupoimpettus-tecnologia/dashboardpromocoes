@@ -1381,7 +1381,7 @@ def main():
         unsafe_allow_html=True,
     )
     st.image(
-        "assets/c__Users_drocha_AppData_Roaming_Cursor_User_workspaceStorage_cb478c36bd1b422772966273318d7de3_images_logo_impettus_Prancheta_1__1_-772f81d0-2fd5-4d03-b43e-5bdb782c26a8.png",
+        "assets/logo-impettus.png",
         use_column_width=False,
         width=250,
     )
