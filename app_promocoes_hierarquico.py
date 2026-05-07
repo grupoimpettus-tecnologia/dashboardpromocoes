@@ -538,81 +538,6 @@ def consultar_promocoes(token, codfranqueador, lojas_completas, marca, max_worke
             thread_local.session = requests.Session()
         return thread_local.session
 
-    def _to_float(value):
-        if value is None:
-            return None
-        if isinstance(value, (int, float)):
-            return float(value)
-        try:
-            return float(str(value).strip().replace(",", "."))
-        except (TypeError, ValueError):
-            return None
-
-    def _obter_precos_tabela_loja(cliente_http, codigo_loja):
-        headers_local = {"Authorization": f"Bearer {token}"}
-        try:
-            r_tabela = cliente_http.get(
-                f"{DEGUST_API_BASE}/api/tabela-preco",
-                params={"CodigoLoja": int(codigo_loja), "Ativo": True},
-                headers=headers_local,
-                timeout=15,
-            )
-            if r_tabela.status_code != 200:
-                return {}
-            tabelas = r_tabela.json()
-            if not isinstance(tabelas, list) or not tabelas:
-                return {}
-            codigo_tabela = tabelas[0].get("codigoTabela")
-            if codigo_tabela is None:
-                return {}
-
-            r_prod = cliente_http.get(
-                f"{DEGUST_API_BASE}/api/tabela-preco/produtos",
-                params={"TabelaPreco": int(codigo_tabela), "TipoVenda": 0},
-                headers=headers_local,
-                timeout=30,
-            )
-            if r_prod.status_code != 200:
-                return {}
-            produtos_tabela = r_prod.json()
-            if not isinstance(produtos_tabela, list):
-                return {}
-
-            mapa = {}
-            for p in produtos_tabela:
-                cod = p.get("codigoProduto")
-                val = _to_float(p.get("valor"))
-                if cod is None or val is None or val <= 0:
-                    continue
-                try:
-                    mapa[int(cod)] = val
-                except (TypeError, ValueError):
-                    continue
-            return mapa
-        except Exception:
-            return {}
-
-    def _aplicar_fallback_preco_tabela(dados_loja, mapa_precos):
-        if not dados_loja or not mapa_precos:
-            return
-        for item in dados_loja:
-            cod = item.get("codigoProduto")
-            try:
-                cod_int = int(cod)
-            except (TypeError, ValueError):
-                continue
-            preco_base = mapa_precos.get(cod_int)
-            if preco_base is None:
-                continue
-            valor_promocional = _to_float(item.get("valorPromocionalMix"))
-            valor_mix = _to_float(item.get("valorMix"))
-
-            # Corrige linhas cujo preço promocional veio zerado da API de promoções.
-            if valor_promocional is None or valor_promocional <= 0:
-                item["valorPromocionalMix"] = f"{preco_base:.2f}"
-            if valor_mix is None or valor_mix <= 0:
-                item["valorMix"] = f"{preco_base:.2f}"
-
     def _consultar_loja(loja):
         codigo_loja = loja["codigoLoja"]
         nome_loja = loja.get("nomeLoja", "N/A")
@@ -625,9 +550,6 @@ def consultar_promocoes(token, codfranqueador, lojas_completas, marca, max_worke
             if response.status_code != 200:
                 return codigo_loja, nome_loja, []
             dados = response.json() or []
-            if isinstance(dados, list) and dados:
-                precos_tabela = _obter_precos_tabela_loja(_session_thread(), codigo_loja)
-                _aplicar_fallback_preco_tabela(dados, precos_tabela)
             for item in dados:
                 item["codigoLoja"] = codigo_loja
                 item["nomeLoja"] = nome_loja
