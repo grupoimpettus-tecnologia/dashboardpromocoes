@@ -155,60 +155,6 @@ def _manter_loja_apos_consulta_cadastro(loja, ativo_cadastro):
     return _loja_degust_ativa(loja)
 
 
-def _to_float_or_none(valor):
-    if valor is None:
-        return None
-    if isinstance(valor, (int, float)):
-        try:
-            return float(valor)
-        except (TypeError, ValueError):
-            return None
-    s = str(valor).strip()
-    if not s:
-        return None
-    s = s.replace("R$", "").replace(" ", "").replace(".", "").replace(",", ".")
-    try:
-        return float(s)
-    except (TypeError, ValueError):
-        return None
-
-
-def _primeiro_valor_positivo(item, chaves):
-    for chave in chaves:
-        valor = _to_float_or_none(item.get(chave))
-        if valor is not None and valor > 0:
-            return valor
-    return None
-
-
-def _normalizar_valores_promocionais(item):
-    valor_mix = _to_float_or_none(item.get("valorMix"))
-    valor_promocional_mix = _to_float_or_none(item.get("valorPromocionalMix"))
-
-    if valor_mix is None or valor_mix <= 0:
-        valor_mix = _primeiro_valor_positivo(item, [
-            "valorProduto", "valor", "preco", "precoVenda", "valorVenda",
-            "valorUnitario", "valorTabela", "valorNormal", "precoTabela"
-        ])
-
-    if valor_promocional_mix is None or valor_promocional_mix <= 0:
-        valor_promocional_mix = _primeiro_valor_positivo(item, [
-            "valorPromocional", "valorPromocao", "valorProdutoPromocional",
-            "precoPromocional", "precoPromocao", "valorVendaPromocional",
-            "valorUnitarioPromocional", "valorPromocionalProduto"
-        ])
-
-    if (valor_mix is None or valor_mix <= 0) and (valor_promocional_mix is not None and valor_promocional_mix > 0):
-        valor_mix = valor_promocional_mix
-    if (valor_promocional_mix is None or valor_promocional_mix <= 0) and (valor_mix is not None and valor_mix > 0):
-        valor_promocional_mix = valor_mix
-
-    if valor_mix is not None:
-        item["valorMix"] = round(valor_mix, 2)
-    if valor_promocional_mix is not None:
-        item["valorPromocionalMix"] = round(valor_promocional_mix, 2)
-
-
 def _filtrar_lojas_por_cadastro_degust(lojas, token, codfranqueador, max_workers=8):
     if not lojas:
         return []
@@ -303,7 +249,6 @@ def consultar_promocoes(token, codfranqueador, lojas_completas, marca):
                 dados = response.json()
                 if dados:
                     for item in dados:
-                        _normalizar_valores_promocionais(item)
                         item["codigoLoja"] = codigo_loja
                         item["nomeLoja"] = nome_loja  # Adicionar nome da loja
                         item["marca"] = marca
