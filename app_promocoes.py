@@ -263,6 +263,50 @@ def consultar_promocoes(token, codfranqueador, lojas_completas, marca):
     
     return dados_todas_lojas
 
+
+def auditar_promocoes_unidade(df):
+    """
+    Audita produtos da categoria PROMOÇÕES DA UNIDADE/PROMOÇÕES - para validar
+    se há indícios de preço de tabela (sem preço promocional efetivo).
+    """
+    if df.empty:
+        return pd.DataFrame()
+
+    if not {"nomeGrupo", "nomePromocao"}.issubset(df.columns):
+        return pd.DataFrame()
+
+    work = df.copy()
+    nome_grupo = work["nomeGrupo"].astype(str).str.upper()
+    nome_promocao = work["nomePromocao"].astype(str).str.upper()
+    mask = (
+        (nome_grupo.str.contains("PROMOÇÕES DA UNIDADE", na=False) | nome_grupo.str.contains("PROMOCOES DA UNIDADE", na=False))
+        & (nome_promocao.str.contains("PROMOÇÕES - ", na=False) | nome_promocao.str.contains("PROMOCOES - ", na=False))
+    )
+    work = work.loc[mask].copy()
+    if work.empty:
+        return pd.DataFrame()
+
+    work["valorMix_num"] = pd.to_numeric(work.get("valorMix"), errors="coerce")
+    work["valorPromocionalMix_num"] = pd.to_numeric(work.get("valorPromocionalMix"), errors="coerce")
+    work["suspeita_preco_tabela"] = (
+        work["valorPromocionalMix_num"].isna()
+        | (work["valorPromocionalMix_num"] <= 0)
+        | (
+            work["valorMix_num"].notna()
+            & work["valorPromocionalMix_num"].notna()
+            & (work["valorPromocionalMix_num"] >= work["valorMix_num"])
+        )
+    )
+
+    colunas_saida = [
+        col for col in [
+            "marca", "codigoLoja", "nomeLoja", "nomePromocao", "nomeGrupo",
+            "codigoProduto", "descricaoProduto", "valorMix", "valorPromocionalMix",
+            "suspeita_preco_tabela"
+        ] if col in work.columns
+    ]
+    return work[colunas_saida]
+
 def consultar_produtos_grupo_venda_orientada(token, codfranqueador, lojas_completas, marca, nome_grupo="Promoção"):
     """Consulta produtos por grupo de venda orientada de todas as lojas usando autenticação da API
     
@@ -458,44 +502,9 @@ def carregar_dados_marca(marca):
     if not lojas_completas:
         return pd.DataFrame()
     
-    # Consultar promoções normais
+    # Regra de negócio: PROMOÇÕES DA UNIDADE deve vir EXCLUSIVAMENTE
+    # da API /api/produto/consultar-promocoes.
     dados = consultar_promocoes(token, codfranqueador, lojas_completas, marca)
-    
-    # Consultar produtos do grupo de venda orientada "Promoção"
-    dados_grupo_venda = consultar_produtos_grupo_venda_orientada(
-        token, 
-        codfranqueador, 
-        lojas_completas, 
-        marca, 
-        nome_grupo="Promoção"
-    )
-    
-    # ALTERNATIVA: Se a API não retornou dados, extrair produtos das promoções normais
-    # que tenham nomeGrupo="PROMOÇÕES DA UNIDADE" e nomePromocao contendo "PROMOCOES"
-    # (esses são os produtos do grupo "Promoção")
-    if not dados_grupo_venda and dados:
-        dados_grupo_venda_alternativa = []
-        for item in dados:
-            # Verificar se é produto do grupo de venda orientada "Promoção"
-            nome_grupo = str(item.get('nomeGrupo', '')).strip().upper()
-            nome_promocao = str(item.get('nomePromocao', '')).strip().upper()
-            
-            # Produtos com nomeGrupo="PROMOÇÕES DA UNIDADE" e nomePromocao contendo "PROMOCOES"
-            # são do grupo "Promoção" - independente do gvoCodigo
-            if "PROMOÇÕES DA UNIDADE" in nome_grupo or "PROMOCOES DA UNIDADE" in nome_grupo:
-                # Verificar também se o nome da promoção contém "PROMOCOES" ou "PROMOÇÕES"
-                if "PROMOCOES" in nome_promocao or "PROMOÇÕES" in nome_promocao:
-                    # Criar cópia do item e marcar como grupo de venda orientada
-                    item_grupo = item.copy()
-                    item_grupo["grupoVendaOrientada"] = "PROMOCAO"
-                    dados_grupo_venda_alternativa.append(item_grupo)
-        
-        if dados_grupo_venda_alternativa:
-            dados_grupo_venda = dados_grupo_venda_alternativa
-    
-    # Combinar dados de promoções normais e grupo de venda orientada
-    if dados_grupo_venda:
-        dados.extend(dados_grupo_venda)
     
     if dados:
         df = pd.DataFrame(dados)
@@ -542,11 +551,13 @@ def main():
     
     # Carregar dados de todas as marcas selecionadas
     todos_dados = []
+    auditoria_por_marca = {}
     
     for marca in marcas_selecionadas:
         with st.spinner(f"Carregando dados de {marca}..."):
             df_marca = carregar_dados_marca(marca)
             if not df_marca.empty:
+                auditoria_por_marca[marca] = auditar_promocoes_unidade(df_marca)
                 todos_dados.append(df_marca)
     
     if not todos_dados:
@@ -597,6 +608,27 @@ def main():
             cor = MARCAS_CONFIG[marca]["cor"]
             
             st.markdown(f"### <span style='color: {cor}'>{marca}</span>", unsafe_allow_html=True)
+
+            df_auditoria = auditoria_por_marca.get(marca, pd.DataFrame())
+            if not df_auditoria.empty:
+                total_auditados = len(df_auditoria)
+                suspeitos = int(df_auditoria["suspeita_preco_tabela"].sum()) if "suspeita_preco_tabela" in df_auditoria.columns else 0
+                col_a1, col_a2 = st.columns(2)
+                with col_a1:
+                    st.metric("🔎 Itens auditados (PROMOÇÕES DA UNIDADE)", total_auditados)
+                with col_a2:
+                    st.metric("⚠️ Suspeita de preço de tabela", suspeitos)
+
+                if suspeitos > 0:
+                    st.warning(
+                        "Foram encontrados itens com possível valor incorreto em PROMOÇÕES DA UNIDADE "
+                        "(sem valor promocional ou valor promocional >= valor base)."
+                    )
+                    st.dataframe(
+                        df_auditoria[df_auditoria["suspeita_preco_tabela"] == True],
+                        use_container_width=True,
+                        height=220
+                    )
             
             # Informações da tabela
             col1, col2, col3, col4 = st.columns(4)
