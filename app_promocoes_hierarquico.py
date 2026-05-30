@@ -11,14 +11,8 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 import io
 import json
 import html
-import sys
-from pathlib import Path
 
-# Módulo de venda orientada (grupo PROMOCAO por unidade)
-_VO_PKG = Path(__file__).resolve().parent / "testes_isolados" / "venda_orientada"
-if str(_VO_PKG) not in sys.path:
-    sys.path.insert(0, str(_VO_PKG))
-from hmg_promocoes_unidade import (  # noqa: E402
+from hmg_promocoes_unidade import (
     BASE_PRD,
     COLUNAS_RETAGUARDA,
     carregar_todas_unidades_marca,
