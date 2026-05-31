@@ -15,7 +15,6 @@ import html
 from hmg_promocoes_unidade import (
     BASE_PRD,
     COLUNAS_RETAGUARDA,
-    carregar_todas_unidades_marca,
 )
 
 COLUNAS_VO_PROMOCAO = COLUNAS_RETAGUARDA
@@ -23,6 +22,16 @@ COLUNAS_VO_PROMOCAO_OCULTAS = {
     "Grupo",
     "Descrição do Grupo",
     "Descrição Monitor",
+    "domingo",
+    "segunda",
+    "terca",
+    "quarta",
+    "quinta",
+    "sexta",
+    "sabado",
+    "restricaoHorario",
+    "valorMix",
+    "valorPromocionalMix",
 }
 COLUNAS_VO_PROMOCAO_EXIBICAO = [
     c for c in COLUNAS_VO_PROMOCAO if c not in COLUNAS_VO_PROMOCAO_OCULTAS
@@ -349,53 +358,74 @@ def _mapa_opcoes_vo_multiloja(mapa_vo, codigos_rede):
     return opcoes
 
 
-def listar_opcoes_cliques_promocao(df_marca, mapa_vo):
-    """
-    Opção D (híbrida): ações PROMOÇÕES REDE + VO categoria PROMOÇÃO por loja
-    + agrupamentos multi-loja por Descrição Monitor.
-    """
-    opcoes = list(listar_nomes_promocao_rede(df_marca))
-    codigos_rede = _codigos_promocoes_rede_union(df_marca)
+def _mapa_opcoes_vo_por_produto(mapa_vo):
+    """Um item por produto da categoria PROMOÇÃO (todas as lojas), chave = nome exibido."""
+    grupos = defaultdict(lambda: {"rotulo": "", "codigos": set()})
 
-    mult = _mapa_opcoes_vo_multiloja(mapa_vo, codigos_rede)
-    opcoes.extend(sorted(mult.keys()))
+    for _cod_loja, _nome_loja, linhas in _iter_unidades_vo_com_produtos(mapa_vo):
+        for ln in linhas:
+            if not isinstance(ln, dict):
+                continue
+            cod = _int_codigo_produto(ln.get("Produto"))
+            if cod is None:
+                continue
+            rotulo = (
+                (ln.get("Descrição do produto") or ln.get("Descrição Monitor") or "")
+                .strip()
+            )
+            if not rotulo:
+                rotulo = f"Produto {cod}"
+            chave = _normalizar_grupo(rotulo)
+            if not grupos[chave]["rotulo"]:
+                grupos[chave]["rotulo"] = rotulo
+            grupos[chave]["codigos"].add(cod)
 
-    for _cod_loja, nome_loja, _linhas in _iter_unidades_vo_com_produtos(mapa_vo):
-        label = f"{PREFIX_OPCAO_VO_PROMOCAO}{_nome_promocoes_unidade_loja(nome_loja)}"
-        opcoes.append(label)
-
+    opcoes = {}
+    for info in sorted(grupos.values(), key=lambda x: x["rotulo"].upper()):
+        rotulo = info["rotulo"]
+        cods = info["codigos"]
+        if not cods:
+            continue
+        label = rotulo
+        if label in opcoes and opcoes[label] != cods:
+            for cod in sorted(cods):
+                alt = f"{rotulo} ({cod})"
+                opcoes[alt] = {cod}
+        else:
+            opcoes[label] = set(cods)
     return opcoes
 
 
+def listar_opcoes_cliques_vo(mapa_vo):
+    """Lista nomes de produtos VO (categoria PROMOÇÃO) para o bloco 2 de cliques."""
+    return sorted(_mapa_opcoes_vo_por_produto(mapa_vo).keys())
+
+
+def resolver_codigos_cliques_vo(mapa_vo, nome_produto):
+    """Códigos Degust do produto VO selecionado (pode abranger várias lojas)."""
+    if not nome_produto:
+        return set()
+    return set(_mapa_opcoes_vo_por_produto(mapa_vo).get(nome_produto, set()))
+
+
+def listar_opcoes_cliques_promocao(df_marca, mapa_vo=None):
+    """Bloco 1: apenas ações do grupo PROMOÇÕES DE REDE."""
+    _ = mapa_vo
+    return list(listar_nomes_promocao_rede(df_marca))
+
+
 def resolver_codigos_cliques(df_marca, mapa_vo, nome_opcao):
-    """Resolve o conjunto de codigoProduto conforme a opção selecionada no selectbox."""
+    """Resolve codigoProduto para ação PROMOÇÕES DE REDE (bloco 1)."""
+    _ = mapa_vo
     if not nome_opcao:
         return set()
-    if not str(nome_opcao).startswith(PREFIX_OPCAO_VO_PROMOCAO):
-        return codigos_produtos_promocao_rede(df_marca, nome_opcao)
-
-    codigos_rede = _codigos_promocoes_rede_union(df_marca)
-    mult = _mapa_opcoes_vo_multiloja(mapa_vo, codigos_rede)
-    if nome_opcao in mult:
-        return set(mult[nome_opcao])
-
-    rest = str(nome_opcao)[len(PREFIX_OPCAO_VO_PROMOCAO) :]
-    rest_norm = _normalizar_grupo(rest)
-    for _cod_loja, nome_loja, linhas in _iter_unidades_vo_com_produtos(mapa_vo):
-        if _normalizar_grupo(_nome_promocoes_unidade_loja(nome_loja)) == rest_norm:
-            return _codigos_de_linhas_vo(linhas)
-    return set()
+    return codigos_produtos_promocao_rede(df_marca, nome_opcao)
 
 
 def origem_opcao_cliques(nome_opcao):
     if not nome_opcao:
         return ""
-    if not str(nome_opcao).startswith(PREFIX_OPCAO_VO_PROMOCAO):
-        return "Promoções de rede"
-    rest = str(nome_opcao)[len(PREFIX_OPCAO_VO_PROMOCAO) :]
-    if _normalizar_grupo(rest).startswith("PROMOCOES -"):
-        return "Categoria PROMOÇÃO (venda orientada — unidade)"
-    return "Categoria PROMOÇÃO (venda orientada — multi-loja)"
+    return "Promoções de rede"
 
 
 def gerar_blocos_30_dias(data_inicio, data_fim):
@@ -721,12 +751,14 @@ def montar_tabela_cliques_promocao_rede(
     progress_bar=None,
     status_label=None,
     mapa_vo=None,
+    produtos_set=None,
 ):
     """
     Por loja: colunas = um bloco de até 30 dias cada + Acumulado (cliques).
     Retorna (DataFrame, mensagem_erro). mensagem_erro só se falha grosseira.
     """
-    produtos_set = resolver_codigos_cliques(df_marca, mapa_vo, nome_promocao)
+    if produtos_set is None:
+        produtos_set = resolver_codigos_cliques(df_marca, mapa_vo, nome_promocao)
     if not produtos_set:
         return None, (
             "Nenhum produto encontrado para esta opção "
@@ -878,8 +910,460 @@ def _session_flag_true_callback(flag_key: str):
     return _on_click
 
 
+def _render_bloco_cliques_por_loja(
+    marca,
+    df_marca,
+    titulo_expander,
+    texto_markdown,
+    caption_help,
+    prefixo_key,
+    opcoes,
+    label_selectbox,
+    resolver_produtos_fn,
+    origem_label,
+    mensagem_vazio,
+    excel_prefix,
+):
+    """Expander reutilizável: selectbox + consulta de cliques por loja e período."""
+    _exp_key = f"ui_exp_cliques_{prefixo_key}_{marca}"
+    _chave_df = f"cliques_{prefixo_key}_df_{marca}"
+    _exp_aberto = (
+        st.session_state.get(_exp_key, False)
+        or (
+            _chave_df in st.session_state
+            and st.session_state.get(_chave_df) is not None
+        )
+    )
+    with st.expander(titulo_expander, expanded=_exp_aberto):
+        st.markdown(texto_markdown)
+        st.caption(caption_help)
+        if not opcoes:
+            st.info(mensagem_vazio)
+            return
+        nome_sel = st.selectbox(
+            label_selectbox,
+            opcoes,
+            key=f"sel_cliques_{prefixo_key}_{marca}",
+        )
+        c_a, c_b, c_c = st.columns(3)
+        with c_a:
+            d_ini_acao = st.date_input(
+                "Início da ação",
+                value=date.today() - timedelta(days=29),
+                format="DD/MM/YYYY",
+                key=f"dini_cliques_{prefixo_key}_{marca}",
+            )
+        with c_b:
+            d_fim_analise = st.date_input(
+                "Último dia da análise",
+                value=date.today(),
+                format="DD/MM/YYYY",
+                key=f"dfim_cliques_{prefixo_key}_{marca}",
+            )
+        with c_c:
+            max_wr = st.number_input(
+                "Qtda de consultas por loja ao mesmo tempo (Limite 6)",
+                min_value=1,
+                max_value=6,
+                value=2,
+                key=f"max_wr_cliques_{prefixo_key}_{marca}",
+            )
+
+        n_prods = len(resolver_produtos_fn(nome_sel))
+        st.caption(
+            f"Origem: **{origem_label}** · Produtos agregados: **{n_prods}** código(s)."
+        )
+
+        if st.button(
+            "Consultar cliques por loja e período",
+            key=f"btn_cliques_{prefixo_key}_{marca}",
+            on_click=_session_flag_true_callback(_exp_key),
+            use_container_width=True,
+        ):
+            if d_fim_analise < d_ini_acao:
+                st.error("A data final deve ser maior ou igual à data de início da ação.")
+            else:
+                codfranqueador = MARCAS_CONFIG[marca]["codfranqueador"]
+                produtos_set = resolver_produtos_fn(nome_sel)
+                prog = st.progress(0)
+                status_txt = st.empty()
+                with st.spinner(
+                    "Consultando relatório de vendas e garçom por loja (pode levar alguns minutos)…"
+                ):
+                    df_cliques, err = montar_tabela_cliques_promocao_rede(
+                        codfranqueador,
+                        df_marca,
+                        nome_sel,
+                        d_ini_acao,
+                        d_fim_analise,
+                        max_workers=int(max_wr),
+                        progress_bar=prog,
+                        status_label=status_txt,
+                        produtos_set=produtos_set,
+                    )
+                prog.empty()
+                status_txt.empty()
+                if err:
+                    st.error(err)
+                elif df_cliques is not None and not df_cliques.empty:
+                    st.session_state[_chave_df] = df_cliques
+                    st.session_state[f"cliques_{prefixo_key}_meta_{marca}"] = {
+                        "promocao": nome_sel,
+                        "inicio": _formatar_data_br(d_ini_acao),
+                        "fim": _formatar_data_br(d_fim_analise),
+                        "gerado_em": _agora_brasilia_str(),
+                    }
+                    st.success("Consulta concluída.")
+                else:
+                    st.warning("Nenhum dado retornado.")
+
+        if _chave_df in st.session_state and st.session_state[_chave_df] is not None:
+            meta = st.session_state.get(f"cliques_{prefixo_key}_meta_{marca}", {})
+            if meta:
+                _ge = meta.get("gerado_em")
+                _suf = f" · Consulta gerada em {_ge}" if _ge else ""
+                st.caption(
+                    f"Última consulta: **{meta.get('promocao', '')}** — "
+                    f"{meta.get('inicio', '')} a {meta.get('fim', '')}{_suf}"
+                )
+            _df_cliq = st.session_state[_chave_df].copy()
+            _rank = _df_cliq[
+                _df_cliq[COL_CLIQUES_NOME_LOJA].astype(str)
+                != _ROTULO_TOTAL_CLIQUES_REDE
+            ]
+            _top_loja = None
+            if (
+                not _rank.empty
+                and COL_CLIQUES_ACUMULADO in _rank.columns
+                and COL_CLIQUES_NOME_LOJA in _rank.columns
+            ):
+                _acc = pd.to_numeric(
+                    _rank[COL_CLIQUES_ACUMULADO], errors="coerce"
+                ).fillna(0)
+                _top_loja = str(_rank.loc[_acc.idxmax(), COL_CLIQUES_NOME_LOJA])
+            if _top_loja:
+                st.markdown(
+                    f"Loja com mais aderência na ação até o momento: **{_top_loja}** 🏆"
+                )
+            _cols_show = _colunas_exibicao_tabela_cliques(_df_cliq)
+            st.dataframe(
+                _estilizar_cabecalhos_tabela_cliques(_df_cliq[_cols_show]),
+                use_container_width=True,
+                hide_index=True,
+            )
+            buf = io.BytesIO()
+            with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+                st.session_state[_chave_df].to_excel(
+                    writer, index=False, sheet_name="Cliques"
+                )
+                ws = writer.sheets["Cliques"]
+                for cell in ws[1]:
+                    cell.font = Font(bold=True)
+            buf.seek(0)
+            st.download_button(
+                label="⬇️ Baixar tabela de cliques (Excel)",
+                data=buf,
+                file_name=f"{excel_prefix}_{marca.replace(' ', '_')}_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key=f"dl_cliques_{prefixo_key}_{marca}",
+            )
+
+
 def _nome_promocoes_unidade_loja(nome_loja):
     return f"PROMOÇÕES - {str(nome_loja or '').upper().strip()}"
+
+
+_URL_VO_CONFIG = "/api/venda-orientada/consultar-venda-orientada"
+_URL_VO_PRODUTO = "/api/venda-orientada/consultar-produto-por-grupo-venda-orientada"
+_URL_LOJA_DETALHE = "/api/loja/loja"
+_URL_CARDAPIO_PRODUTOS = "/api/produto/relacao-cardapio-produto"
+_GRUPO_VO_PROMOCAO = "PROMOCAO"
+_VO_PROMOCAO_MIN_PRODUTOS = 5
+_VO_SCAN_MAX = 400
+
+
+def _extrair_lista_vo(dados):
+    if dados is None:
+        return []
+    if isinstance(dados, list):
+        return dados
+    if isinstance(dados, dict):
+        for chave in ("data", "produtos", "itens", "items", "resultado", "content"):
+            val = dados.get(chave)
+            if isinstance(val, list):
+                return val
+        return [dados]
+    return []
+
+
+def _grupo_vo_eh_promocao(item):
+    desc = str(item.get("grupoDescricao") or item.get("descricaoGrupo") or "").strip().upper()
+    return desc == _GRUPO_VO_PROMOCAO or desc == "PROMOÇÃO" or desc == "PROMOÇOES"
+
+
+def _obter_nome_venda_orientada_loja(session, token, codfranqueador, codigo_loja):
+    """Nome da VO no cadastro da loja (ex.: OUT_2025 EC RECREIO) — GET /api/loja/loja."""
+    url = f"{DEGUST_API_BASE.rstrip('/')}{_URL_LOJA_DETALHE}"
+    headers = {"Authorization": f"Bearer {token}"}
+    try:
+        resp = session.get(
+            url,
+            params={"CodigoFranqueador": int(codfranqueador), "CodigoLoja": int(codigo_loja)},
+            headers=headers,
+            timeout=15,
+        )
+        if resp.status_code != 200:
+            return ""
+        cfg = (resp.json() or {}).get("configuracaoVenda") or {}
+        return str(cfg.get("configuracaoVendaOrientada") or "").strip()
+    except Exception:
+        return ""
+
+
+def _obter_ids_cardapio_loja(session, token, codfranqueador, codigo_loja):
+    url = f"{DEGUST_API_BASE.rstrip('/')}{_URL_CARDAPIO_PRODUTOS}"
+    headers = {"Authorization": f"Bearer {token}"}
+    try:
+        resp = session.get(
+            url,
+            params={"CodigoFranqueador": int(codfranqueador), "CodigoLoja": int(codigo_loja)},
+            headers=headers,
+            timeout=25,
+        )
+        if resp.status_code != 200:
+            return frozenset()
+        return frozenset(
+            item.get("codigoProduto")
+            for item in _extrair_lista_vo(resp.json())
+            if item.get("codigoProduto") is not None
+        )
+    except Exception:
+        return frozenset()
+
+
+def _carregar_promocao_por_codigo_vo(session, token, codfranqueador, max_vo=_VO_SCAN_MAX):
+    """Mapa codigo vendaOrientada (int) -> ids de produtos do grupo PROMOCAO."""
+    url = f"{DEGUST_API_BASE.rstrip('/')}{_URL_VO_PRODUTO}"
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    mapa = {}
+
+    def _probe(codigo_vo):
+        try:
+            resp = session.post(
+                url,
+                json={"codigoFranquia": int(codfranqueador), "vendaOrientada": int(codigo_vo)},
+                headers=headers,
+                timeout=12,
+            )
+            if resp.status_code != 200:
+                return codigo_vo, frozenset()
+            prom = frozenset(
+                item.get("produto")
+                for item in _extrair_lista_vo(resp.json())
+                if _grupo_vo_eh_promocao(item) and item.get("produto") is not None
+            )
+            return codigo_vo, prom
+        except Exception:
+            return codigo_vo, frozenset()
+
+    workers = min(8, max(1, max_vo))
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        for codigo_vo, prom in executor.map(_probe, range(1, max_vo + 1)):
+            if prom:
+                mapa[int(codigo_vo)] = prom
+    return mapa
+
+
+def _config_casa_loja(config_nome, nome_loja):
+    cfg = _normalizar_grupo(config_nome).replace(" ", "")
+    loja = _normalizar_grupo(nome_loja).replace(" ", "")
+    if not cfg or not loja:
+        return False
+    return loja in cfg or cfg.endswith(loja)
+
+
+def _mapear_configuracao_vo_franquia(session, token, codfranqueador, lojas, mapa_prom_vo):
+    """
+    Associa configuracaoVendaOrientada (nome) -> codigo vendaOrientada (int).
+    Usa GET /api/loja/loja + overlap cardapio x grupo PROMOCAO (1 VO por config).
+    """
+    config_lojas = {}
+    for loja in lojas or []:
+        try:
+            codigo_loja = int(loja["codigoLoja"])
+        except (TypeError, ValueError):
+            continue
+        if codigo_loja == 999:
+            continue
+        nome_loja = loja.get("nomeLoja") or ""
+        config_nome = _obter_nome_venda_orientada_loja(
+            session, token, codfranqueador, codigo_loja
+        )
+        if not config_nome:
+            continue
+        cardapio_ids = _obter_ids_cardapio_loja(session, token, codfranqueador, codigo_loja)
+        if not cardapio_ids:
+            continue
+        config_lojas.setdefault(config_nome, []).append(
+            {"codigo_loja": codigo_loja, "nome_loja": nome_loja, "cardapio": cardapio_ids}
+        )
+
+    if not config_lojas or not mapa_prom_vo:
+        return {}
+
+    edges = []
+    for config_nome, entries in config_lojas.items():
+        for codigo_vo, prom in mapa_prom_vo.items():
+            if len(prom) < _VO_PROMOCAO_MIN_PRODUTOS:
+                continue
+            overlaps = []
+            bonus_nome = 0.0
+            for entry in entries:
+                card = entry["cardapio"]
+                overlaps.append(len(prom & card) / len(prom))
+                if _config_casa_loja(config_nome, entry["nome_loja"]):
+                    bonus_nome = 0.02
+            if not overlaps:
+                continue
+            overlap = max(overlaps)
+            if overlap >= 0.80:
+                miss = min(len(prom - entry["cardapio"]) for entry in entries)
+                score = overlap + bonus_nome + (0.06 * miss)
+                edges.append((score, overlap, len(prom), codigo_vo, config_nome))
+
+    edges.sort(reverse=True)
+    mapa_config = {}
+    used_vo = set()
+    for score, overlap, n_prom, codigo_vo, config_nome in edges:
+        if config_nome in mapa_config or codigo_vo in used_vo:
+            continue
+        mapa_config[config_nome] = int(codigo_vo)
+        used_vo.add(int(codigo_vo))
+
+    return mapa_config
+
+
+def _consultar_venda_orientada_config(session, token, codfranqueador, codigo_vo):
+    """consultar-venda-orientada: configuração da VO (complementar; pode retornar vazio)."""
+    url = f"{DEGUST_API_BASE.rstrip('/')}{_URL_VO_CONFIG}"
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    try:
+        resp = session.post(
+            url,
+            json={"codigoFranquia": int(codfranqueador), "codigoVendaOrientada": int(codigo_vo)},
+            headers=headers,
+            timeout=15,
+        )
+        if resp.status_code == 200:
+            return _extrair_lista_vo(resp.json())
+    except Exception:
+        pass
+    return []
+
+
+def _consultar_produtos_grupo_vo(session, token, codfranqueador, codigo_vo):
+    """consultar-produto-por-grupo-venda-orientada — filtra grupo PROMOCAO."""
+    url = f"{DEGUST_API_BASE.rstrip('/')}{_URL_VO_PRODUTO}"
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    try:
+        resp = session.post(
+            url,
+            json={"codigoFranquia": int(codfranqueador), "vendaOrientada": int(codigo_vo)},
+            headers=headers,
+            timeout=15,
+        )
+        if resp.status_code != 200:
+            return []
+        return [
+            item
+            for item in _extrair_lista_vo(resp.json())
+            if isinstance(item, dict) and _grupo_vo_eh_promocao(item)
+        ]
+    except Exception:
+        return []
+
+
+def _valor_campo_vo(item, *chaves, default=""):
+    for chave in chaves:
+        val = item.get(chave)
+        if val is not None and str(val).strip() not in ("", "None", "N/A"):
+            return str(val).strip()
+    return default
+
+
+def _linha_retaguarda_vo(item):
+    produto = _valor_campo_vo(
+        item, "produto", "codigoProduto", "idProduto", "codigo", "id", default=""
+    )
+    descricao = _valor_campo_vo(
+        item,
+        "produtoDescricao",
+        "descricao do produto",
+        "descricaoProduto",
+        "nomeProduto",
+        "descricao",
+        default="",
+    )
+    grupo = _valor_campo_vo(
+        item, "grupo", "nomeGrupoVendaOrientada", "grupoVendaOrientada", default=""
+    )
+    desc_grupo = _valor_campo_vo(
+        item, "grupoDescricao", "descricaoGrupo", "descricao do grupo", default=_GRUPO_VO_PROMOCAO
+    )
+    monitor = _valor_campo_vo(
+        item, "descricaoMonitor", "Descrição Monitor", default=descricao
+    )
+    linha = {
+        "Produto": produto,
+        "Descrição do produto": descricao,
+        "Grupo": grupo,
+        "Descrição do Grupo": desc_grupo,
+        "Descrição Monitor": monitor,
+    }
+    for dia in ("domingo", "segunda", "terca", "quarta", "quinta", "sexta", "sabado"):
+        linha[dia] = _valor_campo_vo(item, dia, default="")
+    linha["restricaoHorario"] = _valor_campo_vo(item, "restricaoHorario", default="")
+    linha["valorMix"] = _valor_campo_vo(item, "valorMix", default="")
+    linha["valorPromocionalMix"] = _valor_campo_vo(item, "valorPromocionalMix", default="")
+    return linha
+
+
+def _processar_loja_vo_promocao(token, codfranqueador, loja, mapa_config_vo):
+    thread_local = threading.local()
+
+    def _session():
+        if not hasattr(thread_local, "session"):
+            thread_local.session = requests.Session()
+        return thread_local.session
+
+    session = _session()
+    codigo_loja = int(loja["codigoLoja"])
+    nome_loja = loja.get("nomeLoja") or "N/A"
+    nome_vo = _obter_nome_venda_orientada_loja(session, token, codfranqueador, codigo_loja)
+    if not nome_vo:
+        return None
+
+    codigo_vo = (mapa_config_vo or {}).get(nome_vo)
+    if codigo_vo is None:
+        return None
+
+    produtos = _consultar_produtos_grupo_vo(session, token, codfranqueador, codigo_vo)
+    _consultar_venda_orientada_config(session, token, codfranqueador, codigo_vo)
+    linhas = [_linha_retaguarda_vo(p) for p in produtos if isinstance(p, dict)]
+    if not linhas:
+        return None
+
+    return {
+        "codigo_loja": codigo_loja,
+        "nome_loja": nome_loja,
+        "linhas_retaguarda": linhas,
+        "venda_orientada": int(codigo_vo),
+        "venda_orientada_rotulo": nome_vo,
+        "metodo_venda_orientada": (
+            f"consultar-venda-orientada + consultar-produto-por-grupo-venda-orientada "
+            f"(config={nome_vo}, VO={codigo_vo})"
+        ),
+    }
 
 
 def _eh_promocao_unidade_por_nome(nome_promocao, nome_loja):
@@ -892,18 +1376,50 @@ def _eh_promocao_unidade_por_nome(nome_promocao, nome_loja):
 
 
 @st.cache_data(ttl=300)
-def carregar_mapa_vo_promocao_por_loja(codfranqueador, total_lojas):
-    """Produtos do grupo PROMOCAO (venda orientada) indexados por codigoLoja — somente PRD."""
+def carregar_mapa_categoria_vo_por_loja(codfranqueador, total_lojas):
+    """Produtos VO PROMOCAO (CATEGORIA PROMOÇÃO) indexados por codigoLoja — API PRD do dashboard."""
+    _ = total_lojas
     try:
-        resultado = carregar_todas_unidades_marca(
-            BASE_PRD,
-            int(codfranqueador),
-            max_vo=max(int(total_lojas or 0) + 15, 80),
-        )
+        with requests.Session() as session:
+            token = autenticar(int(codfranqueador), session=session)
+            if not token:
+                return {}
+            lojas = obter_lojas(token, int(codfranqueador), session=session)
+            if not lojas:
+                return {}
+
+            mapa_prom_vo = _carregar_promocao_por_codigo_vo(session, token, int(codfranqueador))
+            if not mapa_prom_vo:
+                return {}
+
+            mapa_config_vo = _mapear_configuracao_vo_franquia(
+                session, token, int(codfranqueador), lojas, mapa_prom_vo
+            )
+            if not mapa_config_vo:
+                return {}
+
+            workers = min(8, max(1, len(lojas)))
+            unidades = []
+
+            with ThreadPoolExecutor(max_workers=workers) as executor:
+                futuros = {
+                    executor.submit(
+                        _processar_loja_vo_promocao, token, int(codfranqueador), loja, mapa_config_vo
+                    ): loja
+                    for loja in lojas
+                }
+                for futuro in as_completed(futuros):
+                    try:
+                        resultado = futuro.result()
+                        if resultado:
+                            unidades.append(resultado)
+                    except Exception:
+                        continue
     except Exception:
         return {}
+
     mapa = {}
-    for unidade in resultado.get("unidades") or []:
+    for unidade in unidades:
         try:
             cod = int(unidade.get("codigo_loja"))
         except (TypeError, ValueError):
@@ -912,11 +1428,13 @@ def carregar_mapa_vo_promocao_por_loja(codfranqueador, total_lojas):
     return mapa
 
 
-def _garantir_secao_promocoes_loja_vo(grupos_lojas, mapa_vo):
-    """Garante bloco PROMOÇÕES - LOJA quando há produtos VO e a promoção ainda não existe."""
-    for cod_loja, vo in (mapa_vo or {}).items():
-        linhas = vo.get("linhas_retaguarda") or []
-        if not linhas:
+def _garantir_secao_promocoes_loja_vo(grupos_lojas, mapa_categoria_vo):
+    """Garante bloco PROMOÇÕES - LOJA quando há produtos da CATEGORIA PROMOÇÃO."""
+    codigos = set((mapa_categoria_vo or {}).keys())
+    for cod_loja in codigos:
+        vo = (mapa_categoria_vo or {}).get(cod_loja) or {}
+        linhas_cat = vo.get("linhas_retaguarda") or []
+        if not linhas_cat:
             continue
         nome_loja = vo.get("nome_loja") or "N/A"
         chave_loja = f"{cod_loja} - {nome_loja}"
@@ -962,23 +1480,40 @@ def _html_tabela_vo_promocao(df):
     )
 
 
-def _exibir_categoria_vo_promocao(nome_loja, vo_dados):
-    """Tabela estilo Retaguarda: grupo PROMOCAO da venda orientada."""
-    if not vo_dados:
-        return
-    linhas = vo_dados.get("linhas_retaguarda") or []
-    if not linhas:
+def _exibir_tabela_promocoes_loja(nome_loja, produtos):
+    """Tabela da seção PROMOÇÕES - LOJA com dados do endpoint consultar-promocoes."""
+    titulo = f'📋 PROMOÇÕES - {str(nome_loja or "").upper()}'
+    st.markdown(f"**{titulo}**")
+    if not produtos:
+        st.info(f"Nenhum produto encontrado em PROMOÇÕES - {str(nome_loja or '').upper()}.")
         return
 
-    titulo = f'CATEGORIA "PROMOÇÕES" - {str(nome_loja or "").upper()}'
+    df_produtos = pd.DataFrame(produtos)
+    colunas_existentes = _colunas_tabela_produtos_promocao(df_produtos)
+    df_produtos_ordenado = df_produtos[colunas_existentes]
+    st.dataframe(
+        df_produtos_ordenado,
+        use_container_width=True,
+        height=min(400, len(df_produtos) * 35 + 50),
+    )
+
+
+def _exibir_categoria_promocao_vo(nome_loja, vo_dados=None):
+    """CATEGORIA PROMOÇÃO: produtos VO criados (API PRD), distintos do cardápio com desconto."""
     st.markdown(
-        f'<div class="vo-promocao-titulo">📋 {html.escape(titulo)}</div>',
+        '<div class="vo-promocao-titulo">📋 CATEGORIA PROMOÇÃO</div>',
         unsafe_allow_html=True,
     )
     st.markdown(
-        '<div class="vo-promocao-legenda">Produtos que aparecem dentro da categoria na loja.</div>',
+        '<div class="vo-promocao-legenda">Aqui mostra os produtos de promoção que foram criados. '
+        "Que não são produtos do cardápio que sofreram desconto</div>",
         unsafe_allow_html=True,
     )
+
+    linhas = (vo_dados or {}).get("linhas_retaguarda") or []
+    if not linhas:
+        st.info("Nenhum produto encontrado na categoria PROMOÇÃO (venda orientada — grupo PROMOCAO).")
+        return
 
     n = len(linhas)
     vo = vo_dados.get("venda_orientada", "N/A")
@@ -1402,7 +1937,8 @@ def consultar_produtos_grupo_venda_orientada(token, codfranqueador, lojas_comple
                 {"codigoFranquia": codfranqueador, "codigoLoja": codigo_loja, "nomeGrupoVendaOrientada": nome_grupo},
                 {"codigoFranquia": codfranqueador, "codigoLoja": codigo_loja, "nomeGrupoVendaOrientada": nome_grupo.upper()},
                 {"codigoFranquia": codfranqueador, "codigoLoja": codigo_loja, "nomeGrupoVendaOrientada": "Promoção"},
-                {"codigoFranquia": codfranqueador, "codigoLoja": codigo_loja, "nomeGrupoVendaOrientada": "PROMOÇÃO"}
+                {"codigoFranquia": codfranqueador, "codigoLoja": codigo_loja, "nomeGrupoVendaOrientada": "PROMOÇÃO"},
+                {"codigoFranquia": codfranqueador, "codigoLoja": codigo_loja, "nomeGrupoVendaOrientada": "PROMOÇÕES"},
             ]
         # Montar bodies: bases; depois com codigoVendaOrientada, vendaOrientada e nomeVendaOrientada (API pode usar qualquer um)
         bodies_teste = list(bases)
@@ -1928,15 +2464,15 @@ def _exibir_metrica_texto_completo(label, valor):
     )
 
 
-def exibir_loja_hierarquica(chave_loja, dados_loja, cor_marca, mapa_vo_promocao=None):
+def exibir_loja_hierarquica(chave_loja, dados_loja, cor_marca, mapa_categoria_vo=None):
     """Exibe uma loja e suas promoções no formato hierárquico"""
     
-    mapa_vo_promocao = mapa_vo_promocao or {}
+    mapa_categoria_vo = mapa_categoria_vo or {}
     try:
         cod_loja_int = int(dados_loja["info_loja"]["codigoLoja"])
     except (TypeError, ValueError):
         cod_loja_int = None
-    vo_loja = mapa_vo_promocao.get(cod_loja_int) if cod_loja_int is not None else None
+    categoria_vo_loja = mapa_categoria_vo.get(cod_loja_int) if cod_loja_int is not None else None
     nome_loja = dados_loja["info_loja"].get("nomeLoja", "N/A")
     # Separar promoções ativas e inativas
     promocoes_ativas = {}
@@ -1997,12 +2533,13 @@ def exibir_loja_hierarquica(chave_loja, dados_loja, cor_marca, mapa_vo_promocao=
         if promocoes_ativas:
             st.markdown("**🟢 Promoções Ativas:**")
             for nome_promocao, dados_promocao in promocoes_ativas.items():
+                eh_unidade = _eh_promocao_unidade_por_nome(nome_promocao, nome_loja)
                 exibir_promocao_dentro_loja(
                     nome_promocao,
                     dados_promocao,
                     cor_marca,
                     nome_loja=nome_loja,
-                    vo_promocao=vo_loja if _eh_promocao_unidade_por_nome(nome_promocao, nome_loja) else None,
+                    categoria_vo_loja=categoria_vo_loja if eh_unidade else None,
                 )
         
         # Exibir promoções inativas consolidadas
@@ -2045,7 +2582,13 @@ def exibir_loja_hierarquica(chave_loja, dados_loja, cor_marca, mapa_vo_promocao=
             else:
                 st.info("Nenhuma promoção inativa encontrada.")
 
-def exibir_promocao_dentro_loja(nome_promocao, dados_promocao, cor_marca, nome_loja=None, vo_promocao=None):
+def exibir_promocao_dentro_loja(
+    nome_promocao,
+    dados_promocao,
+    cor_marca,
+    nome_loja=None,
+    categoria_vo_loja=None,
+):
     """Exibe uma promoção dentro de uma loja, incluindo categorias de grupo de venda orientada"""
     
     # Container para a promoção
@@ -2074,21 +2617,25 @@ def exibir_promocao_dentro_loja(nome_promocao, dados_promocao, cor_marca, nome_l
             for categoria in dados_promocao.get('categorias', {}).values():
                 total_produtos += len(categoria.get('produtos', []))
             st.markdown(f"**{total_produtos} produtos**")
-        
-        # Exibir produtos normais (se houver)
-        if dados_promocao.get('produtos'):
+
+        eh_promo_unidade = _eh_promocao_unidade_por_nome(nome_promocao, nome_loja)
+
+        # Exibir produtos normais (promoções que não são PROMOÇÕES - LOJA)
+        if dados_promocao.get('produtos') and not eh_promo_unidade:
             st.markdown("**📋 Produtos:**")
-            # Criar DataFrame dos produtos
             df_produtos = pd.DataFrame(dados_promocao['produtos'])
             colunas_existentes = _colunas_tabela_produtos_promocao(df_produtos)
             df_produtos_ordenado = df_produtos[colunas_existentes]
-            
-            # Exibir tabela de produtos
             st.dataframe(
                 df_produtos_ordenado,
                 use_container_width=True,
                 height=min(400, len(df_produtos) * 35 + 50)
             )
+
+        # PROMOÇÕES - LOJA: tabela usa exclusivamente endpoint consultar-promocoes
+        if eh_promo_unidade:
+            _exibir_tabela_promocoes_loja(nome_loja, dados_promocao.get("produtos"))
+            _exibir_categoria_promocao_vo(nome_loja, categoria_vo_loja)
         
         # Exibir categorias de grupo de venda orientada (se houver)
         # Para TODAS as marcas: produtos do grupo de venda orientada aparecem em categoria separada
@@ -2116,16 +2663,11 @@ def exibir_promocao_dentro_loja(nome_promocao, dados_promocao, cor_marca, nome_l
                 else:
                     # Mostrar mensagem se não houver produtos (mas categoria existe)
                     st.info(f"Nenhum produto encontrado na categoria '{nome_categoria}'.")
-        
-        # Categoria VO PROMOCAO (Retaguarda) abaixo de PROMOÇÕES - LOJA
-        if vo_promocao and nome_loja:
-            _exibir_categoria_vo_promocao(nome_loja, vo_promocao)
-        
-        # Se não há produtos, categorias nem VO
+
         if (
             not dados_promocao.get('produtos')
             and not dados_promocao.get('categorias')
-            and not (vo_promocao and (vo_promocao.get('linhas_retaguarda') or []))
+            and not eh_promo_unidade
         ):
             st.info("Nenhum produto encontrado para esta promoção.")
         
@@ -2254,15 +2796,13 @@ def main():
             st.markdown(f"### <span style='color: {cor}'>{marca}</span>", unsafe_allow_html=True)
 
             codfranqueador = MARCAS_CONFIG[marca]["codfranqueador"]
-            with st.spinner(f"Carregando produtos VO PROMOCAO de {marca}…"):
-                mapa_vo_promocao = carregar_mapa_vo_promocao_por_loja(
-                    codfranqueador,
-                    df_marca["codigoLoja"].nunique() if "codigoLoja" in df_marca.columns else 0,
-                )
+            with st.spinner(f"Carregando categoria PROMOÇÃO (VO) de {marca}…"):
+                n_lojas = df_marca["codigoLoja"].nunique() if "codigoLoja" in df_marca.columns else 0
+                mapa_categoria_vo = carregar_mapa_categoria_vo_por_loja(codfranqueador, n_lojas)
 
             # Agrupar dados por loja e promoção
             grupos_lojas = agrupar_por_loja_e_promocao(df_marca)
-            _garantir_secao_promocoes_loja_vo(grupos_lojas, mapa_vo_promocao)
+            _garantir_secao_promocoes_loja_vo(grupos_lojas, mapa_categoria_vo)
             
             # Informações da marca
             col1, col2, col3 = st.columns(3)
@@ -2273,170 +2813,63 @@ def main():
             with col3:
                 st.metric("📊 Total de Produtos", len(df_marca))
             
-            _exp_cliques_key = f"ui_exp_cliques_rede_{marca}"
-            _chave_df_cliques = f"cliques_rede_df_{marca}"
-            _exp_cliques_aberto = (
-                st.session_state.get(_exp_cliques_key, False)
-                or (
-                    _chave_df_cliques in st.session_state
-                    and st.session_state.get(_chave_df_cliques) is not None
-                )
-            )
-            with st.expander(
-                "📈 AÇÕES PROMOÇÕES DE REDE - Cliques (Vendas) por loja",
-                expanded=_exp_cliques_aberto,
-            ):
-                st.markdown(
+            _render_bloco_cliques_por_loja(
+                marca=marca,
+                df_marca=df_marca,
+                titulo_expander="📈 AÇÕES PROMOÇÕES DE REDE - Cliques (Vendas) por loja",
+                texto_markdown=(
                     "Clique = quantidade vendida do item no relatório de vendas. "
-                    "Inclui ações do grupo **PROMOÇÕES DE REDE** e produtos da **categoria PROMOÇÃO** "
-                    "(venda orientada), como na seção por loja do dashboard."
-                )
-                st.caption(
+                    "Inclui apenas ações do grupo **PROMOÇÕES DE REDE**."
+                ),
+                caption_help=(
+                    "**Garçom e cliques no período:**\n\n"
+                    "-> **Nome do Garçom**: Todos os usuários cadastrados no PDV e que participaram "
+                    "na venda da ação.\n\n"
+                    "-> **Tabela de preço**: Tabela de preço usada atualmente na loja.\n\n"
+                    "-> **Períodos**: Respeitam apenas blocos de até 30 dias (limite da API)."
+                ),
+                prefixo_key="rede",
+                opcoes=listar_opcoes_cliques_promocao(df_marca),
+                label_selectbox="Nome da promoção",
+                resolver_produtos_fn=lambda nome: resolver_codigos_cliques(
+                    df_marca, None, nome
+                ),
+                origem_label="Promoções de rede",
+                mensagem_vazio=(
+                    "Não há promoções do grupo PROMOÇÕES REDE para esta marca."
+                ),
+                excel_prefix="cliques_rede",
+            )
+
+            _render_bloco_cliques_por_loja(
+                marca=marca,
+                df_marca=df_marca,
+                titulo_expander="📈 AÇÕES PROMOÇÕES DE REDE 2 - Cliques (Vendas) por loja",
+                texto_markdown=(
+                    "Clique = quantidade vendida do item no relatório de vendas. "
+                    "Inclui produtos da **categoria PROMOÇÃO** (venda orientada), "
+                    "listados individualmente por nome."
+                ),
+                caption_help=(
                     "**Garçom e cliques no período:**\n\n"
                     "-> **Nome do Garçom**: Todos os usuários cadastrados no PDV e que participaram "
                     "na venda da ação.\n\n"
                     "-> **Tabela de preço**: Tabela de preço usada atualmente na loja.\n\n"
                     "-> **Períodos**: Respeitam apenas blocos de até 30 dias (limite da API).\n\n"
-                    "-> **Lista**: opções `[Categoria PROMOÇÃO]` vêm da VO; itens em várias lojas "
-                    "também aparecem agrupados por descrição monitor."
-                )
-                opcoes_cliques = listar_opcoes_cliques_promocao(df_marca, mapa_vo_promocao)
-                if not opcoes_cliques:
-                    st.info(
-                        "Não há promoções do grupo PROMOÇÕES REDE nem produtos na "
-                        "categoria PROMOÇÃO (venda orientada) para esta marca."
-                    )
-                else:
-                    nome_sel = st.selectbox(
-                        "Nome da promoção",
-                        opcoes_cliques,
-                        key=f"sel_promo_rede_{marca}",
-                    )
-                    c_a, c_b, c_c = st.columns(3)
-                    with c_a:
-                        d_ini_acao = st.date_input(
-                            "Início da ação",
-                            value=date.today() - timedelta(days=29),
-                            format="DD/MM/YYYY",
-                            key=f"dini_acao_{marca}",
-                        )
-                    with c_b:
-                        d_fim_analise = st.date_input(
-                            "Último dia da análise",
-                            value=date.today(),
-                            format="DD/MM/YYYY",
-                            key=f"dfim_analise_{marca}",
-                        )
-                    with c_c:
-                        max_wr = st.number_input(
-                            "Qtda de consultas por loja ao mesmo tempo (Limite 6)",
-                            min_value=1,
-                            max_value=6,
-                            value=2,
-                            key=f"max_wr_cliques_{marca}",
-                        )
-
-                    n_prods = len(
-                        resolver_codigos_cliques(df_marca, mapa_vo_promocao, nome_sel)
-                    )
-                    _origem = origem_opcao_cliques(nome_sel)
-                    st.caption(
-                        f"Origem: **{_origem}** · Produtos agregados: **{n_prods}** código(s)."
-                    )
-
-                    if st.button(
-                        "Consultar cliques por loja e período",
-                        key=f"btn_cliques_rede_{marca}",
-                        on_click=_session_flag_true_callback(_exp_cliques_key),
-                        use_container_width=True,
-                    ):
-                        if d_fim_analise < d_ini_acao:
-                            st.error("A data final deve ser maior ou igual à data de início da ação.")
-                        else:
-                            codfranqueador = MARCAS_CONFIG[marca]["codfranqueador"]
-                            prog = st.progress(0)
-                            status_txt = st.empty()
-                            with st.spinner(
-                                "Consultando relatório de vendas e garçom por loja (pode levar alguns minutos)…"
-                            ):
-                                df_cliques, err = montar_tabela_cliques_promocao_rede(
-                                    codfranqueador,
-                                    df_marca,
-                                    nome_sel,
-                                    d_ini_acao,
-                                    d_fim_analise,
-                                    max_workers=int(max_wr),
-                                    progress_bar=prog,
-                                    status_label=status_txt,
-                                    mapa_vo=mapa_vo_promocao,
-                                )
-                            prog.empty()
-                            status_txt.empty()
-                            if err:
-                                st.error(err)
-                            elif df_cliques is not None and not df_cliques.empty:
-                                st.session_state[f"cliques_rede_df_{marca}"] = df_cliques
-                                st.session_state[f"cliques_rede_meta_{marca}"] = {
-                                    "promocao": nome_sel,
-                                    "inicio": _formatar_data_br(d_ini_acao),
-                                    "fim": _formatar_data_br(d_fim_analise),
-                                    "gerado_em": _agora_brasilia_str(),
-                                }
-                                st.success("Consulta concluída.")
-                            else:
-                                st.warning("Nenhum dado retornado.")
-
-                    chave_df = f"cliques_rede_df_{marca}"
-                    if chave_df in st.session_state and st.session_state[chave_df] is not None:
-                        meta = st.session_state.get(f"cliques_rede_meta_{marca}", {})
-                        if meta:
-                            _ge = meta.get("gerado_em")
-                            _suf = f" · Consulta gerada em {_ge}" if _ge else ""
-                            st.caption(
-                                f"Última consulta: **{meta.get('promocao', '')}** — "
-                                f"{meta.get('inicio', '')} a {meta.get('fim', '')}{_suf}"
-                            )
-                        _df_cliq = st.session_state[chave_df].copy()
-                        _rank = _df_cliq[
-                            _df_cliq[COL_CLIQUES_NOME_LOJA].astype(str)
-                            != _ROTULO_TOTAL_CLIQUES_REDE
-                        ]
-                        _top_loja = None
-                        if (
-                            not _rank.empty
-                            and COL_CLIQUES_ACUMULADO in _rank.columns
-                            and COL_CLIQUES_NOME_LOJA in _rank.columns
-                        ):
-                            _acc = pd.to_numeric(
-                                _rank[COL_CLIQUES_ACUMULADO], errors="coerce"
-                            ).fillna(0)
-                            _top_loja = str(_rank.loc[_acc.idxmax(), COL_CLIQUES_NOME_LOJA])
-                        if _top_loja:
-                            st.markdown(
-                                f"Loja com mais aderência na ação até o momento: **{_top_loja}** 🏆"
-                            )
-                        _cols_show = _colunas_exibicao_tabela_cliques(_df_cliq)
-                        st.dataframe(
-                            _estilizar_cabecalhos_tabela_cliques(_df_cliq[_cols_show]),
-                            use_container_width=True,
-                            hide_index=True,
-                        )
-                        buf = io.BytesIO()
-                        with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-                            st.session_state[chave_df].to_excel(
-                                writer, index=False, sheet_name="Cliques"
-                            )
-                            ws = writer.sheets["Cliques"]
-                            for cell in ws[1]:
-                                cell.font = Font(bold=True)
-                        buf.seek(0)
-                        st.download_button(
-                            label="⬇️ Baixar tabela de cliques (Excel)",
-                            data=buf,
-                            file_name=f"cliques_rede_{marca.replace(' ', '_')}_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
-                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                            key=f"dl_cliques_rede_{marca}",
-                        )
+                    "-> **Lista**: um produto por linha, agregando códigos em todas as lojas da marca."
+                ),
+                prefixo_key="vo2",
+                opcoes=listar_opcoes_cliques_vo(mapa_categoria_vo),
+                label_selectbox="CATEGORIA PROMOÇÃO - Cliques por loja",
+                resolver_produtos_fn=lambda nome: resolver_codigos_cliques_vo(
+                    mapa_categoria_vo, nome
+                ),
+                origem_label="Categoria PROMOÇÃO (venda orientada)",
+                mensagem_vazio=(
+                    "Não há produtos na categoria PROMOÇÃO (venda orientada) para esta marca."
+                ),
+                excel_prefix="cliques_vo2",
+            )
 
             # Análise de Promoções de Rede
             if f'show_modal_{marca}' in st.session_state and st.session_state[f'show_modal_{marca}']:
@@ -2613,7 +3046,7 @@ def main():
                             chave_loja,
                             dados_loja,
                             cor,
-                            mapa_vo_promocao=mapa_vo_promocao,
+                            mapa_categoria_vo=mapa_categoria_vo,
                         )
                 
                 st.markdown("---")
