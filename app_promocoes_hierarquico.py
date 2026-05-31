@@ -2844,7 +2844,7 @@ def main():
             _render_bloco_cliques_por_loja(
                 marca=marca,
                 df_marca=df_marca,
-                titulo_expander="📈 AÇÕES PROMOÇÕES DE REDE 2 - Cliques (Vendas) por loja",
+                titulo_expander="📈 CATEGORIA PROMOÇÃO - Cliques por loja",
                 texto_markdown=(
                     "Clique = quantidade vendida do item no relatório de vendas. "
                     "Inclui produtos da **categoria PROMOÇÃO** (venda orientada), "
