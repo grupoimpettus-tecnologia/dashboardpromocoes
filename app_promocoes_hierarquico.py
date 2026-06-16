@@ -285,30 +285,47 @@ def _obter_cardapio_detalhado_loja(session, token, codfranqueador, codigo_loja):
         return []
 
 
+def _cluster_vendavel_homogeneo_apos(cod, por_cod, max_itens=15):
+    """
+    Cluster de SKUs vendáveis logo após o código de referência, com o mesmo valorVenda.
+    Ex.: após 2396 → [2397, 2398, 2399] (todos R$ 22). Requer ≥2 itens para expandir.
+    """
+    cluster = []
+    valor_ref = None
+    for c in range(cod + 1, cod + max_itens + 1):
+        item = por_cod.get(c)
+        if not item:
+            break
+        try:
+            valor = float(item.get("valorVenda") or 0)
+        except (TypeError, ValueError):
+            break
+        if valor <= 0:
+            break
+        if valor_ref is None:
+            valor_ref = valor
+        elif abs(valor - valor_ref) > 0.01:
+            break
+        cluster.append(c)
+    return cluster if len(cluster) >= 2 else []
+
+
 def _expandir_codigos_cardapio_loja(cods_base, cardapio_itens, janela=_JANELA_CARDAPIO_CODIGO_VENDA):
     """
-    Quando o código da promoção é apenas referência (valorVenda zerado no cardápio),
-    substitui pelo SKU principal vendável — o maior código do cluster imediato abaixo.
-    Ex.: promo 2396 → conta só 2300, sem somar itens secundários 2298/2299.
-    Promoções cujo código já tem preço no cardápio não são alteradas.
+    Quando o código da promoção é referência (valorVenda zerado) e há um cluster homogêneo
+    logo acima (ex.: 2396 → 2397/2398/2399), conta só o principal (maior do cluster).
+    Caso contrário mantém o código original (ex.: Champions vende no próprio 2363).
     """
+    _ = janela
     out = set(cods_base or [])
     if not out or not cardapio_itens:
         return out
 
     por_cod = {}
-    vendaveis = []
     for item in cardapio_itens:
         cod = _int_codigo_produto(item.get("codigoProduto"))
-        if cod is None:
-            continue
-        por_cod[cod] = item
-        try:
-            if float(item.get("valorVenda") or 0) > 0:
-                vendaveis.append(cod)
-        except (TypeError, ValueError):
-            pass
-    vendaveis = sorted(set(vendaveis))
+        if cod is not None:
+            por_cod[cod] = item
 
     for cod in list(out):
         item = por_cod.get(cod)
@@ -321,23 +338,11 @@ def _expandir_codigos_cardapio_loja(cods_base, cardapio_itens, janela=_JANELA_CA
         if valor_ref > 0:
             continue
 
-        candidatos = [c for c in vendaveis if c < cod and (cod - c) <= janela]
-        if not candidatos:
+        cluster = _cluster_vendavel_homogeneo_apos(cod, por_cod)
+        if not cluster:
             continue
-
-        clusters = []
-        atual = [candidatos[0]]
-        for c in candidatos[1:]:
-            if c - atual[-1] <= 5:
-                atual.append(c)
-            else:
-                clusters.append(atual)
-                atual = [c]
-        clusters.append(atual)
-        melhor = max(clusters, key=lambda cl: cl[-1])
-        cod_principal = melhor[-1]
         out.discard(cod)
-        out.add(cod_principal)
+        out.add(cluster[-1])
     return out
 
 
