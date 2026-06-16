@@ -285,12 +285,13 @@ def _obter_cardapio_detalhado_loja(session, token, codfranqueador, codigo_loja):
         return []
 
 
-def _cluster_vendavel_homogeneo_apos(cod, por_cod, max_itens=15):
+def _clusters_vendaveis_homogeneos_apos(cod, por_cod, max_itens=15):
     """
-    Cluster de SKUs vendáveis logo após o código de referência, com o mesmo valorVenda.
-    Ex.: após 2396 → [2397, 2398, 2399] (todos R$ 22). Requer ≥2 itens para expandir.
+    Agrupa SKUs vendáveis consecutivos após o código de referência por valorVenda.
+    Ex.: após 2396 → [[2397, 2398, 2399], [2400], [2401]].
     """
-    cluster = []
+    clusters: list[list[int]] = []
+    atual: list[int] = []
     valor_ref = None
     for c in range(cod + 1, cod + max_itens + 1):
         item = por_cod.get(c)
@@ -302,19 +303,45 @@ def _cluster_vendavel_homogeneo_apos(cod, por_cod, max_itens=15):
             break
         if valor <= 0:
             break
-        if valor_ref is None:
+        if valor_ref is None or abs(valor - valor_ref) <= 0.01:
             valor_ref = valor
-        elif abs(valor - valor_ref) > 0.01:
-            break
-        cluster.append(c)
-    return cluster if len(cluster) >= 2 else []
+            atual.append(c)
+            continue
+        if atual:
+            clusters.append(atual)
+        atual = [c]
+        valor_ref = valor
+    if atual:
+        clusters.append(atual)
+    return clusters
+
+
+def _codigos_vendaveis_expandidos_apos_referencia(clusters):
+    """
+    De cada cluster homogêneo (≥2 SKUs) fica o maior código; após um cluster multi,
+    inclui no máximo um cluster unitário seguinte (faixa de preço extra da mesma ação).
+    """
+    out: set[int] = set()
+    prev_multi = False
+    for cluster in clusters:
+        if len(cluster) >= 2:
+            out.add(cluster[-1])
+            prev_multi = True
+        elif len(cluster) == 1 and prev_multi:
+            out.add(cluster[0])
+            prev_multi = False
+        else:
+            prev_multi = False
+    return out
 
 
 def _expandir_codigos_cardapio_loja(cods_base, cardapio_itens, janela=_JANELA_CARDAPIO_CODIGO_VENDA):
     """
-    Quando o código da promoção é referência (valorVenda zerado) e há um cluster homogêneo
-    logo acima (ex.: 2396 → 2397/2398/2399), conta só o principal (maior do cluster).
-    Caso contrário mantém o código original (ex.: Champions vende no próprio 2363).
+    Quando o código da promoção é referência (valorVenda zerado), resolve os SKUs
+    vendáveis no cardápio da loja. Em clusters homogêneos (ex.: 2397/2398/2399),
+    conta só o principal (maior do cluster); faixas de preço adicionais da mesma
+    ação (ex.: 2400 após 2399) também entram. Se a venda ocorre no próprio código
+    de referência (ex.: Champions no 2363), ele permanece no conjunto.
     """
     _ = janela
     out = set(cods_base or [])
@@ -338,11 +365,16 @@ def _expandir_codigos_cardapio_loja(cods_base, cardapio_itens, janela=_JANELA_CA
         if valor_ref > 0:
             continue
 
-        cluster = _cluster_vendavel_homogeneo_apos(cod, por_cod)
-        if not cluster:
+        clusters = _clusters_vendaveis_homogeneos_apos(cod, por_cod)
+        if not clusters or len(clusters[0]) < 2:
+            # Champions e similares: vendas no código de referência; SKUs unitários
+            # logo após (ex.: 2364) não são a mesma ação expandida.
+            continue
+        expandidos = _codigos_vendaveis_expandidos_apos_referencia(clusters)
+        if not expandidos:
             continue
         out.discard(cod)
-        out.add(cluster[-1])
+        out.update(expandidos)
     return out
 
 
@@ -590,7 +622,84 @@ def _normalizar_nom_usuario_venda(nome):
     return texto if texto else "(não informado)"
 
 
-def somar_cliques_por_nom_usuario_venda(vendas, produtos_set):
+def _chave_item_venda_clique(item):
+    """Chave estável para cruzar relatório de vendas com o período sincronizado."""
+    cod = item.get("codProduto")
+    try:
+        cod_int = int(cod)
+    except (TypeError, ValueError):
+        cod_int = 0
+    momento = str(item.get("datHoraLancamento") or "")[:19]
+    try:
+        qtd = float(item.get("quantidade") or 0)
+    except (TypeError, ValueError):
+        qtd = 0.0
+    return cod_int, momento, qtd
+
+
+def _mapa_garcom_por_item_sync(vendas_sync):
+    """(codProduto, datHoraLancamento, quantidade) -> codigoGarcom (API sincronizada)."""
+    mapa = {}
+    for venda in vendas_sync or []:
+        if not _venda_nao_cancelada(venda):
+            continue
+        for item in venda.get("itens") or []:
+            if not _item_conta_para_clique(item):
+                continue
+            garcom = item.get("codigoGarcom")
+            try:
+                garcom_int = int(garcom)
+            except (TypeError, ValueError):
+                continue
+            if garcom_int <= 0:
+                continue
+            mapa[_chave_item_venda_clique(item)] = garcom_int
+    return mapa
+
+
+def _mapa_nome_por_garcom(vendas_rel, mapa_garcom_item):
+    """
+    Monta codigoGarcom -> nomUsuarioVenda cruzando relatório de vendas com a API
+    sincronizada (mesmo item: produto + data/hora + quantidade).
+    """
+    nomes = {}
+    for venda in vendas_rel or []:
+        if not _venda_nao_cancelada(venda):
+            continue
+        for item in venda.get("itens") or []:
+            if not _item_conta_para_clique(item):
+                continue
+            nome = str(item.get("nomUsuarioVenda") or "").strip()
+            if not nome:
+                continue
+            garcom = mapa_garcom_item.get(_chave_item_venda_clique(item))
+            if garcom:
+                nomes[garcom] = nome
+    return nomes
+
+
+def _resolver_nome_garcom_item(item, mapa_garcom_item=None, mapa_nome_garcom=None):
+    nome = str(item.get("nomUsuarioVenda") or "").strip()
+    if nome:
+        return nome
+    if not mapa_garcom_item:
+        return ""
+    garcom = mapa_garcom_item.get(_chave_item_venda_clique(item))
+    if not garcom:
+        return ""
+    if mapa_nome_garcom:
+        nome_mapeado = mapa_nome_garcom.get(garcom)
+        if nome_mapeado:
+            return nome_mapeado
+    return f"Garçom código {garcom}"
+
+
+def somar_cliques_por_nom_usuario_venda(
+    vendas,
+    produtos_set,
+    mapa_garcom_item=None,
+    mapa_nome_garcom=None,
+):
     """Soma quantidade por nomUsuarioVenda (itens da promoção, venda/item não cancelados)."""
     por_usuario = defaultdict(float)
     for v in vendas or []:
@@ -608,7 +717,8 @@ def somar_cliques_por_nom_usuario_venda(vendas, produtos_set):
                 continue
             if c not in produtos_set:
                 continue
-            usuario = _normalizar_nom_usuario_venda(it.get("nomUsuarioVenda"))
+            usuario = _resolver_nome_garcom_item(it, mapa_garcom_item, mapa_nome_garcom)
+            usuario = _normalizar_nom_usuario_venda(usuario)
             q = it.get("quantidade")
             try:
                 por_usuario[usuario] += float(q or 0)
@@ -617,7 +727,39 @@ def somar_cliques_por_nom_usuario_venda(vendas, produtos_set):
     return dict(por_usuario)
 
 
-def consultar_relatorio_vendas_agregados(session, token, cod_franqueador, cod_loja, d_ini, d_fim, produtos_set):
+def consultar_relatorio_vendas_list(session, token, cod_franqueador, cod_loja, d_ini, d_fim):
+    """POST /api/venda/relatorio-vendas — retorna lista de vendas ou None."""
+    url = f"{DEGUST_API_BASE}/api/venda/relatorio-vendas"
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    body = {
+        "codFranqueador": int(cod_franqueador),
+        "codLoja": int(cod_loja),
+        "dataInicial": d_ini.isoformat(),
+        "dataFinal": d_fim.isoformat(),
+        "tipoData": "C",
+        "exibirVendasCanceladas": False,
+    }
+    try:
+        r = session.post(url, json=body, headers=headers, timeout=120)
+        if r.status_code != 200:
+            return None
+        vendas = r.json()
+        return vendas if isinstance(vendas, list) else None
+    except Exception:
+        return None
+
+
+def consultar_relatorio_vendas_agregados(
+    session,
+    token,
+    cod_franqueador,
+    cod_loja,
+    d_ini,
+    d_fim,
+    produtos_set,
+    mapa_garcom_item=None,
+    mapa_nome_garcom=None,
+):
     """POST /api/venda/relatorio-vendas — retorna (total cliques, cliques por nomUsuarioVenda) ou None."""
     url = f"{DEGUST_API_BASE}/api/venda/relatorio-vendas"
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
@@ -638,7 +780,12 @@ def consultar_relatorio_vendas_agregados(session, token, cod_franqueador, cod_lo
             return None
         return (
             somar_cliques_em_vendas(vendas, produtos_set),
-            somar_cliques_por_nom_usuario_venda(vendas, produtos_set),
+            somar_cliques_por_nom_usuario_venda(
+                vendas,
+                produtos_set,
+                mapa_garcom_item=mapa_garcom_item,
+                mapa_nome_garcom=mapa_nome_garcom,
+            ),
         )
     except Exception:
         return None
@@ -689,8 +836,8 @@ def somar_cliques_por_garcom(vendas, produtos_set):
     return dict(por_garcom)
 
 
-def consultar_cliques_por_garcom_sinc(session, token, cod_franqueador, cod_loja, d_ini, d_fim, produtos_set):
-    """POST /api/venda/relatorio-vendas-periodo-sincronizado — cliques por codigoGarcom."""
+def consultar_vendas_periodo_sincronizado(session, token, cod_franqueador, cod_loja, d_ini, d_fim):
+    """POST /api/venda/relatorio-vendas-periodo-sincronizado — lista de vendas da loja."""
     url = f"{DEGUST_API_BASE}/api/venda/relatorio-vendas-periodo-sincronizado"
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
     body = {
@@ -709,9 +856,19 @@ def consultar_cliques_por_garcom_sinc(session, token, cod_franqueador, cod_loja,
         if not isinstance(payload, dict):
             return None
         vendas = payload.get("vendas") or []
-        return somar_cliques_por_garcom(vendas, produtos_set)
+        return vendas if isinstance(vendas, list) else None
     except Exception:
         return None
+
+
+def consultar_cliques_por_garcom_sinc(session, token, cod_franqueador, cod_loja, d_ini, d_fim, produtos_set):
+    """POST /api/venda/relatorio-vendas-periodo-sincronizado — cliques por codigoGarcom."""
+    vendas = consultar_vendas_periodo_sincronizado(
+        session, token, cod_franqueador, cod_loja, d_ini, d_fim
+    )
+    if vendas is None:
+        return None, None
+    return somar_cliques_por_garcom(vendas, produtos_set), vendas
 
 
 def _mesclar_contagem_garcom(acumulado, parcial):
@@ -918,18 +1075,26 @@ def montar_tabela_cliques_promocao_rede(
             def _work(cod_loja):
                 loja_cod = int(cod_loja)
                 cods_loja = mapa_cods_loja.get(loja_cod) or produtos_set
-                agg = consultar_relatorio_vendas_agregados(
-                    _sess(), token, codfranqueador, loja_cod, di, df_end, cods_loja
+                sess = _sess()
+                vendas_sync = consultar_vendas_periodo_sincronizado(
+                    sess, token, codfranqueador, loja_cod, di, df_end
+                ) or []
+                vendas_rel = consultar_relatorio_vendas_list(
+                    sess, token, codfranqueador, loja_cod, di, df_end
                 )
-                if agg is None:
+                if vendas_rel is None:
                     soma, por_usuario = 0.0, {}
                 else:
-                    soma, por_usuario = agg
-                    soma = soma if soma is not None else 0.0
-                    por_usuario = por_usuario or {}
-                por_garcom = consultar_cliques_por_garcom_sinc(
-                    _sess(), token, codfranqueador, loja_cod, di, df_end, cods_loja
-                )
+                    mapa_garcom_item = _mapa_garcom_por_item_sync(vendas_sync)
+                    mapa_nome_garcom = _mapa_nome_por_garcom(vendas_rel, mapa_garcom_item)
+                    soma = somar_cliques_em_vendas(vendas_rel, cods_loja)
+                    por_usuario = somar_cliques_por_nom_usuario_venda(
+                        vendas_rel,
+                        cods_loja,
+                        mapa_garcom_item=mapa_garcom_item,
+                        mapa_nome_garcom=mapa_nome_garcom,
+                    )
+                por_garcom = somar_cliques_por_garcom(vendas_sync, cods_loja)
                 return loja_cod, soma, por_usuario, por_garcom or {}
 
             workers = max(1, min(max_workers, len(lojas_df)))
