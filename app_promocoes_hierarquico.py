@@ -287,8 +287,9 @@ def _obter_cardapio_detalhado_loja(session, token, codfranqueador, codigo_loja):
 
 def _expandir_codigos_cardapio_loja(cods_base, cardapio_itens, janela=_JANELA_CARDAPIO_CODIGO_VENDA):
     """
-    Inclui SKUs vendáveis do cardápio quando o código da promoção é apenas referência
-    (valorVenda zerado no cardápio). Caso típico: ação com código 2396 e vendas em 2298–2300.
+    Quando o código da promoção é apenas referência (valorVenda zerado no cardápio),
+    substitui pelo SKU principal vendável — o maior código do cluster imediato abaixo.
+    Ex.: promo 2396 → conta só 2300, sem somar itens secundários 2298/2299.
     Promoções cujo código já tem preço no cardápio não são alteradas.
     """
     out = set(cods_base or [])
@@ -334,12 +335,14 @@ def _expandir_codigos_cardapio_loja(cods_base, cardapio_itens, janela=_JANELA_CA
                 atual = [c]
         clusters.append(atual)
         melhor = max(clusters, key=lambda cl: cl[-1])
-        out.update(melhor)
+        cod_principal = melhor[-1]
+        out.discard(cod)
+        out.add(cod_principal)
     return out
 
 
 def _mapa_codigos_cliques_por_loja(codfranqueador, cods_base, lojas_df, session, token):
-    """codigoLoja -> conjunto de códigos (promoção + variantes vendáveis do cardápio)."""
+    """codigoLoja -> conjunto de códigos (promoção ou código principal vendável por loja)."""
     mapa = {}
     for _, r in lojas_df.iterrows():
         try:
