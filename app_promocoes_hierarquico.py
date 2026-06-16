@@ -285,6 +285,9 @@ def _obter_cardapio_detalhado_loja(session, token, codfranqueador, codigo_loja):
         return []
 
 
+_MAX_FAIXAS_SKUS_UNITARIOS_PROMOCAO = 8
+
+
 def _clusters_vendaveis_homogeneos_apos(cod, por_cod, max_itens=15):
     """
     Agrupa SKUs vendáveis consecutivos após o código de referência por valorVenda.
@@ -335,13 +338,39 @@ def _codigos_vendaveis_expandidos_apos_referencia(clusters):
     return out
 
 
+def _codigos_vendaveis_de_clusters_referencia(clusters):
+    """
+    Resolve SKUs vendáveis a partir dos clusters após o código de referência.
+
+    - Somente unitários (Espetto, Rufino): inclui cada faixa de preço da ação
+      quando há poucas faixas consecutivas (ex.: 1657/1658/1659 após 1656).
+    - Primeiro cluster multi (Mané): principal de cada cluster homogêneo + até
+      uma faixa unitária logo após o primeiro bloco multi (ex.: 2399 e 2400).
+    - Unitários antes do primeiro multi (Champions): não expande; vendas ficam
+      no código de referência (ex.: 2363).
+    """
+    if not clusters:
+        return set()
+
+    tem_multi = any(len(c) >= 2 for c in clusters)
+
+    if not tem_multi:
+        if len(clusters) <= _MAX_FAIXAS_SKUS_UNITARIOS_PROMOCAO:
+            return {c[0] for c in clusters if c}
+        return set()
+
+    if len(clusters[0]) < 2:
+        return set()
+
+    return _codigos_vendaveis_expandidos_apos_referencia(clusters)
+
+
 def _expandir_codigos_cardapio_loja(cods_base, cardapio_itens, janela=_JANELA_CARDAPIO_CODIGO_VENDA):
     """
     Quando o código da promoção é referência (valorVenda zerado), resolve os SKUs
-    vendáveis no cardápio da loja. Em clusters homogêneos (ex.: 2397/2398/2399),
-    conta só o principal (maior do cluster); faixas de preço adicionais da mesma
-    ação (ex.: 2400 após 2399) também entram. Se a venda ocorre no próprio código
-    de referência (ex.: Champions no 2363), ele permanece no conjunto.
+    vendáveis no cardápio da loja — vale para qualquer marca (Mané, Espetto,
+    Bendito, Rufino). Padrões suportados: faixas só unitárias, cluster homogêneo
+    com faixa extra, ou venda no próprio código de referência (Champions).
     """
     _ = janela
     out = set(cods_base or [])
@@ -366,11 +395,7 @@ def _expandir_codigos_cardapio_loja(cods_base, cardapio_itens, janela=_JANELA_CA
             continue
 
         clusters = _clusters_vendaveis_homogeneos_apos(cod, por_cod)
-        if not clusters or len(clusters[0]) < 2:
-            # Champions e similares: vendas no código de referência; SKUs unitários
-            # logo após (ex.: 2364) não são a mesma ação expandida.
-            continue
-        expandidos = _codigos_vendaveis_expandidos_apos_referencia(clusters)
+        expandidos = _codigos_vendaveis_de_clusters_referencia(clusters)
         if not expandidos:
             continue
         out.discard(cod)
