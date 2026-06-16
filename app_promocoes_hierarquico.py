@@ -260,6 +260,97 @@ def codigos_produtos_promocao_rede(df_marca, nome_promocao):
     return out
 
 
+_JANELA_CARDAPIO_CODIGO_VENDA = 120
+
+
+def _obter_cardapio_detalhado_loja(session, token, codfranqueador, codigo_loja):
+    """GET relacao-cardapio-produto — itens com codigoProduto e valorVenda."""
+    url = f"{DEGUST_API_BASE.rstrip('/')}{_URL_CARDAPIO_PRODUTOS}"
+    headers = {"Authorization": f"Bearer {token}"}
+    try:
+        resp = session.get(
+            url,
+            params={"CodigoFranqueador": int(codfranqueador), "CodigoLoja": int(codigo_loja)},
+            headers=headers,
+            timeout=25,
+        )
+        if resp.status_code != 200:
+            return []
+        return [
+            item
+            for item in _extrair_lista_vo(resp.json())
+            if isinstance(item, dict) and item.get("codigoProduto") is not None
+        ]
+    except Exception:
+        return []
+
+
+def _expandir_codigos_cardapio_loja(cods_base, cardapio_itens, janela=_JANELA_CARDAPIO_CODIGO_VENDA):
+    """
+    Inclui SKUs vendáveis do cardápio quando o código da promoção é apenas referência
+    (valorVenda zerado no cardápio). Caso típico: ação com código 2396 e vendas em 2298–2300.
+    Promoções cujo código já tem preço no cardápio não são alteradas.
+    """
+    out = set(cods_base or [])
+    if not out or not cardapio_itens:
+        return out
+
+    por_cod = {}
+    vendaveis = []
+    for item in cardapio_itens:
+        cod = _int_codigo_produto(item.get("codigoProduto"))
+        if cod is None:
+            continue
+        por_cod[cod] = item
+        try:
+            if float(item.get("valorVenda") or 0) > 0:
+                vendaveis.append(cod)
+        except (TypeError, ValueError):
+            pass
+    vendaveis = sorted(set(vendaveis))
+
+    for cod in list(out):
+        item = por_cod.get(cod)
+        if not item:
+            continue
+        try:
+            valor_ref = float(item.get("valorVenda") or 0)
+        except (TypeError, ValueError):
+            valor_ref = 0.0
+        if valor_ref > 0:
+            continue
+
+        candidatos = [c for c in vendaveis if c < cod and (cod - c) <= janela]
+        if not candidatos:
+            continue
+
+        clusters = []
+        atual = [candidatos[0]]
+        for c in candidatos[1:]:
+            if c - atual[-1] <= 5:
+                atual.append(c)
+            else:
+                clusters.append(atual)
+                atual = [c]
+        clusters.append(atual)
+        melhor = max(clusters, key=lambda cl: cl[-1])
+        out.update(melhor)
+    return out
+
+
+def _mapa_codigos_cliques_por_loja(codfranqueador, cods_base, lojas_df, session, token):
+    """codigoLoja -> conjunto de códigos (promoção + variantes vendáveis do cardápio)."""
+    mapa = {}
+    for _, r in lojas_df.iterrows():
+        try:
+            cod_loja = int(r["codigoLoja"])
+        except (TypeError, ValueError):
+            continue
+        cardapio = _obter_cardapio_detalhado_loja(session, token, codfranqueador, cod_loja)
+        mapa[cod_loja] = _expandir_codigos_cardapio_loja(cods_base, cardapio)
+    return mapa
+
+
 PREFIX_OPCAO_VO_PROMOCAO = "[Categoria PROMOÇÃO] "
 MIN_LOJAS_VO_AGREGADO = 3
 FRACAO_LOJAS_VO_AGREGADO = 0.5
@@ -809,13 +900,18 @@ def montar_tabela_cliques_promocao_rede(
         if not token:
             return None, "Falha na autenticação."
 
+        mapa_cods_loja = _mapa_codigos_cliques_por_loja(
+            codfranqueador, produtos_set, lojas_df, main_session, token
+        )
+
         for bidx, (di, df_end) in enumerate(blocos):
             lbl = col_labels[bidx]
 
             def _work(cod_loja):
                 loja_cod = int(cod_loja)
+                cods_loja = mapa_cods_loja.get(loja_cod) or produtos_set
                 agg = consultar_relatorio_vendas_agregados(
-                    _sess(), token, codfranqueador, loja_cod, di, df_end, produtos_set
+                    _sess(), token, codfranqueador, loja_cod, di, df_end, cods_loja
                 )
                 if agg is None:
                     soma, por_usuario = 0.0, {}
@@ -824,7 +920,7 @@ def montar_tabela_cliques_promocao_rede(
                     soma = soma if soma is not None else 0.0
                     por_usuario = por_usuario or {}
                 por_garcom = consultar_cliques_por_garcom_sinc(
-                    _sess(), token, codfranqueador, loja_cod, di, df_end, produtos_set
+                    _sess(), token, codfranqueador, loja_cod, di, df_end, cods_loja
                 )
                 return loja_cod, soma, por_usuario, por_garcom or {}
 
