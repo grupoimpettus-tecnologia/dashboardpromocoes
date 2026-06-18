@@ -1,0 +1,24 @@
+# Bytecode / cache do Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Ambientes virtuais
+.venv/
+venv/
+env/
+
+# Streamlit
+.streamlit/secrets.toml
+
+# Arquivos temporários de diagnóstico
+_diag_*.py
+_probe_*.py
+_valida_*.py
+_teste_*.py
+
+# Sistema operacional / editores
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

@@ -398,9 +398,87 @@ def _expandir_codigos_cardapio_loja(cods_base, cardapio_itens, janela=_JANELA_CA
         expandidos = _codigos_vendaveis_de_clusters_referencia(clusters)
         if not expandidos:
             continue
-        out.discard(cod)
+        # Mantém o código principal (a retaguarda agrupa por ele e ele pode ser
+        # vendido diretamente em algumas lojas) e adiciona os SKUs vendáveis.
         out.update(expandidos)
     return out
+
+
+def _refinar_codigos_acao_por_vendas(cods_base, principais, vendas):
+    """
+    Ajusta o conjunto de códigos de uma ação para contar APENAS o produto principal
+    e seus componentes próprios — espelhando o agrupamento "por produto" da retaguarda.
+
+    Usa a estrutura de combo das vendas (numLanctoItemPrincipal):
+    - Acrescenta componentes que entram a R$ 0,00 ligados EXCLUSIVAMENTE às linhas da
+      ação (ex.: ESPETTO BRASIL 1662, não consecutivo no cardápio), ignorando
+      modificadores genéricos (ponto da carne, talher, molho), que são filhos de
+      muitos produtos.
+    - Quando a ação tem estrutura de combo, remove produtos vizinhos NÃO relacionados
+      que a varredura de cardápio possa ter capturado (ex.: um BALDE listado logo
+      abaixo da Copa), preservando sempre o(s) código(s) principal(is) selecionado(s).
+    - Ações sem combo (ex.: Copa do Mané, que vende direto nos próprios códigos) não
+      sofrem remoção: o conjunto base é mantido.
+    """
+    base = set(cods_base or [])
+    principais = set(principais or [])
+    if not base:
+        return base
+
+    child_owners = defaultdict(set)
+    sold_paid = set()
+    for v in vendas or []:
+        if not _venda_nao_cancelada(v):
+            continue
+        lancto_code = {}
+        for it in v.get("itens") or []:
+            nl = it.get("numLancto")
+            c = _int_codigo_produto(it.get("codProduto"))
+            if nl is not None and c is not None:
+                lancto_code[nl] = c
+        for it in v.get("itens") or []:
+            if not _item_conta_para_clique(it):
+                continue
+            c = _int_codigo_produto(it.get("codProduto"))
+            if c is None:
+                continue
+            try:
+                val = float(it.get("valUnitario") or 0)
+            except (TypeError, ValueError):
+                val = 0.0
+            pai = it.get("numLanctoItemPrincipal")
+            if pai in (0, None):
+                if val > 0.01:
+                    sold_paid.add(c)
+            elif abs(val) < 0.01:
+                child_owners[c].add(lancto_code.get(pai))
+
+    exclusivos = {
+        c: owners
+        for c, owners in child_owners.items()
+        if owners
+        and all(o in base for o in owners)
+        and c not in sold_paid
+        and c not in base
+    }
+
+    combo_owners = set()
+    for owners in exclusivos.values():
+        combo_owners |= owners
+
+    resultado = set(base) | set(exclusivos.keys())
+
+    if combo_owners:
+        for c in list(base):
+            if (
+                c not in principais
+                and c in sold_paid
+                and c not in combo_owners
+                and c not in exclusivos
+            ):
+                resultado.discard(c)
+
+    return resultado
 
 
 def _mapa_codigos_cliques_por_loja(codfranqueador, cods_base, lojas_df, session, token):
@@ -1110,6 +1188,9 @@ def montar_tabela_cliques_promocao_rede(
                 if vendas_rel is None:
                     soma, por_usuario = 0.0, {}
                 else:
+                    cods_loja = _refinar_codigos_acao_por_vendas(
+                        cods_loja, produtos_set, vendas_rel
+                    )
                     mapa_garcom_item = _mapa_garcom_por_item_sync(vendas_sync)
                     mapa_nome_garcom = _mapa_nome_por_garcom(vendas_rel, mapa_garcom_item)
                     soma = somar_cliques_em_vendas(vendas_rel, cods_loja)
