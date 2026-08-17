@@ -2114,37 +2114,36 @@ def _consultar_cadastro_loja(cliente_http, token, codfranqueador, codigo_loja):
         return None
 
 
-def _hora_caixa_informada(valor):
-    """True se o horário de caixa veio preenchido (ex.: 09:44:00:00)."""
-    texto = str(valor or "").strip()
+def _extrair_data_caixa(valor):
+    """Converte dataCaixa da API (ex.: 08/17/2026 00:00:00) para date."""
+    if valor is None:
+        return None
+    if isinstance(valor, datetime):
+        return valor.date()
+    if isinstance(valor, date):
+        return valor
+    texto = str(valor).strip()
     if not texto or texto.lower() in ("none", "null", "n/a"):
-        return False
-    compacto = "".join(ch for ch in texto if ch.isdigit())
-    return bool(compacto.strip("0"))
-
-
-def _caixa_teve_abertura(registros):
-    if not isinstance(registros, list):
-        return False
-    for item in registros:
-        if isinstance(item, dict) and _hora_caixa_informada(item.get("dataHoraAbertura")):
-            return True
-    return False
-
-
-def consultar_detalhamento_caixa(session, token, codfranqueador, codigo_loja, cai_data):
-    """POST /api/caixa/detalhamento-caixa — lista do dia ou None em falha."""
-    url = f"{DEGUST_API_BASE}/api/caixa/detalhamento-caixa"
-    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-    if hasattr(cai_data, "isoformat"):
-        cai_data = cai_data.isoformat()
-    body = {
-        "codigoFranqueador": int(codfranqueador),
-        "codigoLoja": str(codigo_loja),
-        "caiData": str(cai_data),
-    }
+        return None
+    parte = texto.replace("T", " ").split()[0]
+    for fmt in ("%Y-%m-%d", "%m/%d/%Y", "%d/%m/%Y"):
+        try:
+            return datetime.strptime(parte, fmt).date()
+        except ValueError:
+            continue
     try:
-        r = session.post(url, json=body, headers=headers, timeout=20)
+        return datetime.fromisoformat(texto.replace("Z", "+00:00")).date()
+    except ValueError:
+        return None
+
+
+def consultar_flash_vendas(session, token, codfranqueador):
+    """GET /api/financeiro/flash-vendas — lista da franquia ou None em falha."""
+    url = f"{DEGUST_API_BASE}/api/financeiro/flash-vendas"
+    headers = {"Authorization": f"Bearer {token}"}
+    params = {"codigoFranqueador": int(codfranqueador)}
+    try:
+        r = session.get(url, params=params, headers=headers, timeout=20)
         if r.status_code != 200:
             return None
         dados = r.json()
@@ -2155,8 +2154,8 @@ def consultar_detalhamento_caixa(session, token, codfranqueador, codigo_loja, ca
 
 @st.cache_data(ttl=120)
 def carregar_status_caixa_por_loja(codfranqueador, codigos_loja):
-    """codigoLoja -> Online | Fechada | Indisponível (abertura de caixa no dia atual)."""
-    hoje = date.today().isoformat()
+    """codigoLoja -> Online | Fechada | Indisponível (dataCaixa = dia atual)."""
+    hoje = date.today()
     codigos = []
     for codigo in codigos_loja or ():
         try:
@@ -2167,46 +2166,36 @@ def carregar_status_caixa_por_loja(codfranqueador, codigos_loja):
         return {}
 
     try:
-        token = autenticar(int(codfranqueador))
+        with requests.Session() as session:
+            token = autenticar(int(codfranqueador), session=session)
+            if not token:
+                return {c: "Indisponível" for c in codigos}
+            registros = consultar_flash_vendas(session, token, int(codfranqueador))
     except Exception:
-        token = None
-    if not token:
         return {c: "Indisponível" for c in codigos}
 
-    thread_local = threading.local()
+    if registros is None:
+        return {c: "Indisponível" for c in codigos}
 
-    def _session():
-        if not hasattr(thread_local, "session"):
-            thread_local.session = requests.Session()
-        return thread_local.session
-
-    def _status_loja(codigo):
-        registros = consultar_detalhamento_caixa(
-            _session(), token, int(codfranqueador), codigo, hoje
-        )
-        if registros is None:
-            return codigo, "Indisponível"
-        if _caixa_teve_abertura(registros):
-            return codigo, "Online"
-        return codigo, "Fechada"
+    data_por_loja = {}
+    for item in registros:
+        if not isinstance(item, dict):
+            continue
+        try:
+            codigo = int(item.get("codigoLoja"))
+        except (TypeError, ValueError):
+            continue
+        data_por_loja[codigo] = _extrair_data_caixa(item.get("dataCaixa"))
 
     mapa = {}
-    workers = max(1, min(8, len(codigos)))
-    with ThreadPoolExecutor(max_workers=workers) as executor:
-        futuros = [executor.submit(_status_loja, codigo) for codigo in codigos]
-        for futuro in as_completed(futuros):
-            try:
-                codigo, status = futuro.result()
-                mapa[codigo] = status
-            except Exception:
-                continue
     for codigo in codigos:
-        mapa.setdefault(codigo, "Indisponível")
+        data_caixa = data_por_loja.get(codigo)
+        mapa[codigo] = "Online" if data_caixa == hoje else "Fechada"
     return mapa
 
 
 def _aplicar_status_caixa_nas_lojas(grupos_lojas, codfranqueador):
-    """Consulta o caixa do dia e grava statusCaixa em info_loja."""
+    """Consulta flash de vendas e grava statusCaixa em info_loja."""
     if not grupos_lojas:
         return
     codigos = []
@@ -3323,7 +3312,7 @@ def main():
             # Agrupar dados por loja e promoção
             grupos_lojas = agrupar_por_loja_e_promocao(df_marca)
             _garantir_secao_promocoes_loja_vo(grupos_lojas, mapa_categoria_vo)
-            with st.spinner(f"Consultando status do caixa de {marca}…"):
+            with st.spinner(f"Consultando status das lojas de {marca}…"):
                 _aplicar_status_caixa_nas_lojas(grupos_lojas, codfranqueador)
             
             # Informações da marca
