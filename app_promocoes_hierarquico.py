@@ -2224,6 +2224,19 @@ def _rotulo_status_caixa(status):
     return "⚪ Indisponível"
 
 
+def _contagem_status_lojas(grupos_lojas):
+    """Retorna (online, fechadas) a partir de statusCaixa em info_loja."""
+    online = 0
+    fechadas = 0
+    for dados in (grupos_lojas or {}).values():
+        status = (dados.get("info_loja") or {}).get("statusCaixa")
+        if status == "Online":
+            online += 1
+        else:
+            fechadas += 1
+    return online, fechadas
+
+
 def _consultar_ativo_cadastro_loja(cliente_http, token, codfranqueador, codigo_loja):
     cadastro = _consultar_cadastro_loja(cliente_http, token, codfranqueador, codigo_loja)
     if cadastro is None:
@@ -3316,12 +3329,17 @@ def main():
                 _aplicar_status_caixa_nas_lojas(grupos_lojas, codfranqueador)
             
             # Informações da marca
-            col1, col2, col3 = st.columns(3)
+            total_online, total_fechadas = _contagem_status_lojas(grupos_lojas)
+            col1, col2, col3, col4, col5 = st.columns(5)
             with col1:
                 st.metric("🏷️ Marcas", df_marca["marca"].nunique() if "marca" in df_marca.columns else 0)
             with col2:
                 st.metric("📦 Total de Lojas", len(grupos_lojas))
             with col3:
+                st.metric("🟢 Total de lojas Online", total_online)
+            with col4:
+                st.metric("🔴 Total de lojas Fechadas", total_fechadas)
+            with col5:
                 st.metric("📊 Total de Produtos", len(df_marca))
             
             _render_bloco_cliques_por_loja(
