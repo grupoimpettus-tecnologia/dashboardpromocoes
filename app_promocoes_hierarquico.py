@@ -113,6 +113,14 @@ st.markdown("""
         overflow-wrap: anywhere;
         white-space: normal;
     }
+    .loja-status-online {
+        color: #1b7f3a;
+        font-weight: 600;
+    }
+    .loja-status-fechada {
+        color: #c0392b;
+        font-weight: 600;
+    }
     .vo-promocao-meta {
         background: #f8f4fc;
         border: 1px solid #d4c4e8;
@@ -2106,6 +2114,127 @@ def _consultar_cadastro_loja(cliente_http, token, codfranqueador, codigo_loja):
         return None
 
 
+def _hora_caixa_informada(valor):
+    """True se o horário de caixa veio preenchido (ex.: 09:44:00:00)."""
+    texto = str(valor or "").strip()
+    if not texto or texto.lower() in ("none", "null", "n/a"):
+        return False
+    compacto = "".join(ch for ch in texto if ch.isdigit())
+    return bool(compacto.strip("0"))
+
+
+def _caixa_teve_abertura(registros):
+    if not isinstance(registros, list):
+        return False
+    for item in registros:
+        if isinstance(item, dict) and _hora_caixa_informada(item.get("dataHoraAbertura")):
+            return True
+    return False
+
+
+def consultar_detalhamento_caixa(session, token, codfranqueador, codigo_loja, cai_data):
+    """POST /api/caixa/detalhamento-caixa — lista do dia ou None em falha."""
+    url = f"{DEGUST_API_BASE}/api/caixa/detalhamento-caixa"
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    if hasattr(cai_data, "isoformat"):
+        cai_data = cai_data.isoformat()
+    body = {
+        "codigoFranqueador": int(codfranqueador),
+        "codigoLoja": str(codigo_loja),
+        "caiData": str(cai_data),
+    }
+    try:
+        r = session.post(url, json=body, headers=headers, timeout=20)
+        if r.status_code != 200:
+            return None
+        dados = r.json()
+        return dados if isinstance(dados, list) else []
+    except Exception:
+        return None
+
+
+@st.cache_data(ttl=120)
+def carregar_status_caixa_por_loja(codfranqueador, codigos_loja):
+    """codigoLoja -> Online | Fechada | Indisponível (abertura de caixa no dia atual)."""
+    hoje = date.today().isoformat()
+    codigos = []
+    for codigo in codigos_loja or ():
+        try:
+            codigos.append(int(codigo))
+        except (TypeError, ValueError):
+            continue
+    if not codigos:
+        return {}
+
+    try:
+        token = autenticar(int(codfranqueador))
+    except Exception:
+        token = None
+    if not token:
+        return {c: "Indisponível" for c in codigos}
+
+    thread_local = threading.local()
+
+    def _session():
+        if not hasattr(thread_local, "session"):
+            thread_local.session = requests.Session()
+        return thread_local.session
+
+    def _status_loja(codigo):
+        registros = consultar_detalhamento_caixa(
+            _session(), token, int(codfranqueador), codigo, hoje
+        )
+        if registros is None:
+            return codigo, "Indisponível"
+        if _caixa_teve_abertura(registros):
+            return codigo, "Online"
+        return codigo, "Fechada"
+
+    mapa = {}
+    workers = max(1, min(8, len(codigos)))
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futuros = [executor.submit(_status_loja, codigo) for codigo in codigos]
+        for futuro in as_completed(futuros):
+            try:
+                codigo, status = futuro.result()
+                mapa[codigo] = status
+            except Exception:
+                continue
+    for codigo in codigos:
+        mapa.setdefault(codigo, "Indisponível")
+    return mapa
+
+
+def _aplicar_status_caixa_nas_lojas(grupos_lojas, codfranqueador):
+    """Consulta o caixa do dia e grava statusCaixa em info_loja."""
+    if not grupos_lojas:
+        return
+    codigos = []
+    for dados in grupos_lojas.values():
+        try:
+            codigos.append(int(dados["info_loja"]["codigoLoja"]))
+        except (TypeError, ValueError, KeyError):
+            continue
+    if not codigos:
+        return
+    mapa = carregar_status_caixa_por_loja(int(codfranqueador), tuple(sorted(set(codigos))))
+    for dados in grupos_lojas.values():
+        try:
+            codigo = int(dados["info_loja"]["codigoLoja"])
+        except (TypeError, ValueError, KeyError):
+            dados["info_loja"]["statusCaixa"] = "Indisponível"
+            continue
+        dados["info_loja"]["statusCaixa"] = mapa.get(codigo, "Indisponível")
+
+
+def _rotulo_status_caixa(status):
+    if status == "Online":
+        return "🟢 Online"
+    if status == "Fechada":
+        return "🔴 Fechada"
+    return "⚪ Indisponível"
+
+
 def _consultar_ativo_cadastro_loja(cliente_http, token, codfranqueador, codigo_loja):
     cadastro = _consultar_cadastro_loja(cliente_http, token, codfranqueador, codigo_loja)
     if cadastro is None:
@@ -2879,15 +3008,16 @@ def exibir_loja_hierarquica(chave_loja, dados_loja, cor_marca, mapa_categoria_vo
     
     # Criar título do expander com métricas
     tabela_preco = (dados_loja['info_loja'].get('tabelaDePreco') or 'N/A').strip()
+    status_caixa = _rotulo_status_caixa(dados_loja['info_loja'].get('statusCaixa'))
     titulo_expander = (
         f"🏪 {chave_loja} | 🟢 {total_promocoes_ativas} Ativas | 🔴 {total_promocoes_inativas} Inativas "
-        f"| 🎯 {total_produtos} Produtos | 💰 {tabela_preco}"
+        f"| 🎯 {total_produtos} Produtos | 💰 {tabela_preco} | {status_caixa}"
     )
     
     # Expander para a loja inteira
     with st.expander(titulo_expander, expanded=False):
         # Informações gerais da loja
-        col1, col2, col3, col4, col5 = st.columns(5)
+        col1, col2, col3, col4, col5, col6 = st.columns(6)
         with col1:
             st.metric("🟢 Promoções Ativas", total_promocoes_ativas)
         with col2:
@@ -2900,6 +3030,21 @@ def exibir_loja_hierarquica(chave_loja, dados_loja, cor_marca, mapa_categoria_vo
             _exibir_metrica_texto_completo(
                 "💰 Tabela de Preço",
                 dados_loja['info_loja'].get('tabelaDePreco') or 'N/A',
+            )
+        with col6:
+            status_valor = dados_loja['info_loja'].get('statusCaixa') or 'Indisponível'
+            classe_status = (
+                "loja-status-online" if status_valor == "Online"
+                else "loja-status-fechada" if status_valor == "Fechada"
+                else ""
+            )
+            rotulo_status = html.escape(_rotulo_status_caixa(status_valor))
+            st.markdown(
+                f'<div class="loja-metrica-texto">'
+                f'<div class="loja-metrica-label">Status da loja</div>'
+                f'<div class="loja-metrica-valor {classe_status}">{rotulo_status}</div>'
+                f'</div>',
+                unsafe_allow_html=True,
             )
         
         st.markdown("---")
@@ -3178,6 +3323,8 @@ def main():
             # Agrupar dados por loja e promoção
             grupos_lojas = agrupar_por_loja_e_promocao(df_marca)
             _garantir_secao_promocoes_loja_vo(grupos_lojas, mapa_categoria_vo)
+            with st.spinner(f"Consultando status do caixa de {marca}…"):
+                _aplicar_status_caixa_nas_lojas(grupos_lojas, codfranqueador)
             
             # Informações da marca
             col1, col2, col3 = st.columns(3)
