@@ -1081,7 +1081,7 @@ def _estilizar_cabecalhos_tabela_cliques(df):
 
 
 def _valor_promocional_mix_numerico(valor):
-    """Converte valorPromocionalMix para float; None se inválido."""
+    """Converte valor promocional/mix para float; None se inválido."""
     if valor is None:
         return None
     texto = str(valor).strip().replace(",", ".")
@@ -1093,12 +1093,33 @@ def _valor_promocional_mix_numerico(valor):
         return None
 
 
+def _ocultar_coluna_valor_zero(df, nome_coluna):
+    """
+    Na coluna informada: deixa vazio quando for 0.00; remove a coluna se
+    nenhum produto tiver valor > 0; mantém valores > 0.00.
+    """
+    if nome_coluna not in df.columns:
+        return df
+    out = df
+    numeros = out[nome_coluna].map(_valor_promocional_mix_numerico)
+    tem_valor_positivo = numeros.notna() & (numeros.abs() > 0.005)
+    if not tem_valor_positivo.any():
+        return out.drop(columns=[nome_coluna])
+    out = out.copy()
+    out[nome_coluna] = [
+        "" if (n is None or abs(n) <= 0.005) else v
+        for v, n in zip(out[nome_coluna], numeros)
+    ]
+    return out
+
+
 def _preparar_df_produtos_exibicao(df):
     """
     Prepara DataFrame de produtos para tela:
-    - oculta valorPromocionalMix quando for 0.00 (célula vazia);
-    - remove a coluna se nenhum produto tiver valor > 0;
-    - mantém valores > 0.00.
+    - não exibe valorMix / valorPromocionalMix quando forem 0.00;
+    - remove valorPromocionalMix se nenhum produto tiver valor > 0;
+    - mantém valorPromocionalMix quando > 0.00;
+    - oculta colunas internas (produtoPromocaoAtivo, autorizaGerente, taxaServico, valorMix).
     """
     if df is None or getattr(df, "empty", True):
         return df
@@ -1115,20 +1136,22 @@ def _preparar_df_produtos_exibicao(df):
         "restricaoHorario",
         "valorPromocionalMix",
     ]
+    colunas_ocultas = (
+        "produtoPromocaoAtivo",
+        "autorizaGerente",
+        "taxaServico",
+        "valorMix",
+    )
+    # Metadados só da visão consolidada de inativas
+    extras_permitidos = ["Promoção", "Grupo", "Status"]
     out = df.copy()
-    if "valorPromocionalMix" in out.columns:
-        numeros = out["valorPromocionalMix"].map(_valor_promocional_mix_numerico)
-        tem_valor_positivo = numeros.notna() & (numeros.abs() > 0.005)
-        if not tem_valor_positivo.any():
-            out = out.drop(columns=["valorPromocionalMix"])
-        else:
-            out["valorPromocionalMix"] = [
-                "" if (n is None or abs(n) <= 0.005) else v
-                for v, n in zip(out["valorPromocionalMix"], numeros)
-            ]
+    existentes_ocultas = [c for c in colunas_ocultas if c in out.columns]
+    if existentes_ocultas:
+        out = out.drop(columns=existentes_ocultas)
+    out = _ocultar_coluna_valor_zero(out, "valorPromocionalMix")
     colunas = [col for col in colunas_ordenadas if col in out.columns]
-    extras = [col for col in out.columns if col not in colunas]
-    return out[colunas + extras] if extras else out[colunas]
+    extras = [col for col in extras_permitidos if col in out.columns]
+    return out[extras + colunas] if extras else out[colunas]
 
 
 def _colunas_tabela_produtos_promocao(df):
