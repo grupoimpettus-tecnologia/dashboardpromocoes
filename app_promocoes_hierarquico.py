@@ -1080,8 +1080,28 @@ def _estilizar_cabecalhos_tabela_cliques(df):
     )
 
 
-def _colunas_tabela_produtos_promocao(df):
-    """Colunas visíveis da tabela de produtos (valorMix oculto)."""
+def _valor_promocional_mix_numerico(valor):
+    """Converte valorPromocionalMix para float; None se inválido."""
+    if valor is None:
+        return None
+    texto = str(valor).strip().replace(",", ".")
+    if not texto or texto.lower() in ("n/a", "none", "null", ""):
+        return None
+    try:
+        return float(texto)
+    except (TypeError, ValueError):
+        return None
+
+
+def _preparar_df_produtos_exibicao(df):
+    """
+    Prepara DataFrame de produtos para tela:
+    - oculta valorPromocionalMix quando for 0.00 (célula vazia);
+    - remove a coluna se nenhum produto tiver valor > 0;
+    - mantém valores > 0.00.
+    """
+    if df is None or getattr(df, "empty", True):
+        return df
     colunas_ordenadas = [
         "codigoProduto",
         "descricaoProduto",
@@ -1095,7 +1115,25 @@ def _colunas_tabela_produtos_promocao(df):
         "restricaoHorario",
         "valorPromocionalMix",
     ]
-    return [col for col in colunas_ordenadas if col in df.columns]
+    out = df.copy()
+    if "valorPromocionalMix" in out.columns:
+        numeros = out["valorPromocionalMix"].map(_valor_promocional_mix_numerico)
+        tem_valor_positivo = numeros.notna() & (numeros.abs() > 0.005)
+        if not tem_valor_positivo.any():
+            out = out.drop(columns=["valorPromocionalMix"])
+        else:
+            out["valorPromocionalMix"] = [
+                "" if (n is None or abs(n) <= 0.005) else v
+                for v, n in zip(out["valorPromocionalMix"], numeros)
+            ]
+    colunas = [col for col in colunas_ordenadas if col in out.columns]
+    extras = [col for col in out.columns if col not in colunas]
+    return out[colunas + extras] if extras else out[colunas]
+
+
+def _colunas_tabela_produtos_promocao(df):
+    """Colunas visíveis da tabela de produtos (valorMix oculto)."""
+    return list(_preparar_df_produtos_exibicao(df).columns)
 
 
 def _colunas_exibicao_tabela_cliques(df):
@@ -1872,8 +1910,7 @@ def _exibir_tabela_promocoes_loja(nome_loja, produtos):
         return
 
     df_produtos = pd.DataFrame(produtos)
-    colunas_existentes = _colunas_tabela_produtos_promocao(df_produtos)
-    df_produtos_ordenado = df_produtos[colunas_existentes]
+    df_produtos_ordenado = _preparar_df_produtos_exibicao(df_produtos)
     st.dataframe(
         df_produtos_ordenado,
         use_container_width=True,
@@ -3091,9 +3128,10 @@ def exibir_loja_hierarquica(chave_loja, dados_loja, cor_marca, mapa_categoria_vo
                     'valorPromocionalMix',
                 ]
                 
-                # Filtrar apenas colunas que existem
-                colunas_existentes = [col for col in colunas_ordenadas if col in df_consolidado.columns]
-                df_consolidado_ordenado = df_consolidado[colunas_existentes]
+                # Filtrar apenas colunas que existem; ocultar valorPromocionalMix = 0.00
+                df_prep = _preparar_df_produtos_exibicao(df_consolidado)
+                colunas_existentes = [col for col in colunas_ordenadas if col in df_prep.columns]
+                df_consolidado_ordenado = df_prep[colunas_existentes]
                 
                 # Exibir tabela consolidada
                 st.dataframe(
@@ -3146,8 +3184,7 @@ def exibir_promocao_dentro_loja(
         if dados_promocao.get('produtos') and not eh_promo_unidade:
             st.markdown("**📋 Produtos:**")
             df_produtos = pd.DataFrame(dados_promocao['produtos'])
-            colunas_existentes = _colunas_tabela_produtos_promocao(df_produtos)
-            df_produtos_ordenado = df_produtos[colunas_existentes]
+            df_produtos_ordenado = _preparar_df_produtos_exibicao(df_produtos)
             st.dataframe(
                 df_produtos_ordenado,
                 use_container_width=True,
@@ -3172,9 +3209,7 @@ def exibir_promocao_dentro_loja(
                 if produtos_categoria:
                     # Criar DataFrame dos produtos da categoria
                     df_produtos_categoria = pd.DataFrame(produtos_categoria)
-                    nome_grupo = dados_promocao['info_promocao']['nomeGrupo']
-                    colunas_existentes = _colunas_tabela_produtos_promocao(df_produtos_categoria)
-                    df_produtos_categoria_ordenado = df_produtos_categoria[colunas_existentes]
+                    df_produtos_categoria_ordenado = _preparar_df_produtos_exibicao(df_produtos_categoria)
                     
                     # Exibir tabela de produtos da categoria
                     st.dataframe(
@@ -3225,8 +3260,7 @@ def exibir_promocao_inativa_simples(nome_promocao, dados_promocao, cor_marca):
             st.markdown("**📋 Produtos:**")
             # Criar DataFrame dos produtos
             df_produtos = pd.DataFrame(dados_promocao['produtos'])
-            colunas_existentes = _colunas_tabela_produtos_promocao(df_produtos)
-            df_produtos_ordenado = df_produtos[colunas_existentes]
+            df_produtos_ordenado = _preparar_df_produtos_exibicao(df_produtos)
             
             # Exibir tabela de produtos
             st.dataframe(
