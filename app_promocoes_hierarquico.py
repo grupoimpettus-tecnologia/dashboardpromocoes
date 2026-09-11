@@ -379,6 +379,9 @@ def _expandir_codigos_cardapio_loja(cods_base, cardapio_itens, janela=_JANELA_CA
     vendáveis no cardápio da loja — vale para qualquer marca (Mané, Espetto,
     Bendito, Rufino). Padrões suportados: faixas só unitárias, cluster homogêneo
     com faixa extra, ou venda no próprio código de referência (Champions).
+
+    Se nenhum código base da ação existir no cardápio da loja, não expande
+    vizinhos (evita contar SKUs órfãos de outras promoções/produtos).
     """
     _ = janela
     out = set(cods_base or [])
@@ -390,6 +393,11 @@ def _expandir_codigos_cardapio_loja(cods_base, cardapio_itens, janela=_JANELA_CA
         cod = _int_codigo_produto(item.get("codigoProduto"))
         if cod is not None:
             por_cod[cod] = item
+
+    # Sem o produto da ação no cardápio desta loja, mantém só a base (cliques = 0
+    # se não houver venda do código de referência — alinhado à retaguarda).
+    if not any(cod in por_cod for cod in out):
+        return out
 
     for cod in list(out):
         item = por_cod.get(cod)
@@ -410,6 +418,30 @@ def _expandir_codigos_cardapio_loja(cods_base, cardapio_itens, janela=_JANELA_CA
         # vendido diretamente em algumas lojas) e adiciona os SKUs vendáveis.
         out.update(expandidos)
     return out
+
+
+def lojas_participantes_promocao_rede(df_marca, nome_promocao):
+    """Lojas que têm a ação selecionada no grupo PROMOÇÕES REDE."""
+    if (
+        df_marca is None
+        or df_marca.empty
+        or not nome_promocao
+        or "nomeGrupo" not in df_marca.columns
+        or "nomePromocao" not in df_marca.columns
+        or "codigoLoja" not in df_marca.columns
+        or "nomeLoja" not in df_marca.columns
+    ):
+        return pd.DataFrame(columns=["codigoLoja", "nomeLoja"])
+    mask = (
+        df_marca["nomeGrupo"].apply(_eh_promocoes_rede)
+        & (df_marca["nomePromocao"].astype(str) == str(nome_promocao))
+    )
+    return (
+        df_marca.loc[mask, ["codigoLoja", "nomeLoja"]]
+        .drop_duplicates()
+        .sort_values("codigoLoja")
+        .reset_index(drop=True)
+    )
 
 
 def _refinar_codigos_acao_por_vendas(cods_base, principais, vendas):
@@ -1180,10 +1212,14 @@ def montar_tabela_cliques_promocao_rede(
     status_label=None,
     mapa_vo=None,
     produtos_set=None,
+    filtrar_lojas_acao_rede=False,
 ):
     """
     Por loja: colunas = um bloco de até 30 dias cada + Acumulado (cliques).
     Retorna (DataFrame, mensagem_erro). mensagem_erro só se falha grosseira.
+
+    Com filtrar_lojas_acao_rede=True, consulta só lojas que têm a ação em
+    PROMOÇÕES REDE (evita falso positivo em unidades que não participam).
     """
     if produtos_set is None:
         produtos_set = resolver_codigos_cliques(df_marca, mapa_vo, nome_promocao)
@@ -1196,7 +1232,18 @@ def montar_tabela_cliques_promocao_rede(
     if "codigoLoja" not in df_marca.columns or "nomeLoja" not in df_marca.columns:
         return None, "DataFrame sem codigoLoja ou nomeLoja."
 
-    lojas_df = df_marca[["codigoLoja", "nomeLoja"]].drop_duplicates().sort_values("codigoLoja")
+    if filtrar_lojas_acao_rede:
+        lojas_df = lojas_participantes_promocao_rede(df_marca, nome_promocao)
+        if lojas_df.empty:
+            return None, (
+                "Nenhuma loja participante desta ação no grupo PROMOÇÕES REDE."
+            )
+    else:
+        lojas_df = (
+            df_marca[["codigoLoja", "nomeLoja"]]
+            .drop_duplicates()
+            .sort_values("codigoLoja")
+        )
     blocos = gerar_blocos_30_dias(data_inicio, data_fim)
     if not blocos:
         return None, "Intervalo de datas inválido."
@@ -1367,6 +1414,7 @@ def _render_bloco_cliques_por_loja(
     origem_label,
     mensagem_vazio,
     excel_prefix,
+    filtrar_lojas_acao_rede=False,
 ):
     """Expander reutilizável: selectbox + consulta de cliques por loja e período."""
     _exp_key = f"ui_exp_cliques_{prefixo_key}_{marca}"
@@ -1414,9 +1462,21 @@ def _render_bloco_cliques_por_loja(
             )
 
         n_prods = len(resolver_produtos_fn(nome_sel))
-        st.caption(
-            f"Origem: **{origem_label}** · Produtos agregados: **{n_prods}** código(s)."
-        )
+        if filtrar_lojas_acao_rede:
+            n_lojas = len(lojas_participantes_promocao_rede(df_marca, nome_sel))
+            st.caption(
+                f"Origem: **{origem_label}** · Códigos base da ação: **{n_prods}** · "
+                f"Lojas participantes: **{n_lojas}**. "
+                "A contagem usa só lojas com a ação em PROMOÇÕES REDE; "
+                "por loja pode haver SKUs vendáveis derivados do cardápio "
+                "(quando o código base existe nessa loja)."
+            )
+        else:
+            st.caption(
+                f"Origem: **{origem_label}** · Códigos base: **{n_prods}**. "
+                "Por loja a contagem pode incluir SKUs vendáveis derivados do cardápio "
+                "quando o código base existir na unidade."
+            )
 
         if st.button(
             "Consultar cliques por loja e período",
@@ -1444,6 +1504,7 @@ def _render_bloco_cliques_por_loja(
                         progress_bar=prog,
                         status_label=status_txt,
                         produtos_set=produtos_set,
+                        filtrar_lojas_acao_rede=filtrar_lojas_acao_rede,
                     )
                 prog.empty()
                 status_txt.empty()
@@ -3405,14 +3466,16 @@ def main():
                 titulo_expander="📈 AÇÕES PROMOÇÕES DE REDE - Cliques (Vendas) por loja",
                 texto_markdown=(
                     "Clique = quantidade vendida do item no relatório de vendas. "
-                    "Inclui apenas ações do grupo **PROMOÇÕES DE REDE**."
+                    "Inclui apenas ações do grupo **PROMOÇÕES DE REDE** "
+                    "e somente lojas participantes da ação selecionada."
                 ),
                 caption_help=(
                     "**Garçom e cliques no período:**\n\n"
                     "-> **Nome do Garçom**: Todos os usuários cadastrados no PDV e que participaram "
                     "na venda da ação.\n\n"
                     "-> **Tabela de preço**: Tabela de preço usada atualmente na loja.\n\n"
-                    "-> **Períodos**: Respeitam apenas blocos de até 30 dias (limite da API)."
+                    "-> **Períodos**: Respeitam apenas blocos de até 30 dias (limite da API).\n\n"
+                    "-> **Lojas**: apenas unidades com a ação cadastrada em PROMOÇÕES REDE."
                 ),
                 prefixo_key="rede",
                 opcoes=listar_opcoes_cliques_promocao(df_marca),
@@ -3425,6 +3488,7 @@ def main():
                     "Não há promoções do grupo PROMOÇÕES REDE para esta marca."
                 ),
                 excel_prefix="cliques_rede",
+                filtrar_lojas_acao_rede=True,
             )
 
             _render_bloco_cliques_por_loja(
