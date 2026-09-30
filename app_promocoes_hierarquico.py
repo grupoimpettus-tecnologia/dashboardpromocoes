@@ -1706,6 +1706,72 @@ def _gravar_valores_chopp_hh(valores):
     temporario.replace(_ARQUIVO_CHOPP_HH)
 
 
+_PRECOS_INICIAIS_CHOPP_HH = {
+    "AEROTOWN": (6.95, 8.95, None, None),
+    "ALPHAVILLE": (6.95, 8.95, 7.95, None),
+    "AMERICANA": (6.95, 8.95, None, None),
+    "ANDRADINA": (6.95, 8.95, None, None),
+    "BARRA SUL": (6.95, 8.95, None, None),
+    "BELA VISTA": (6.95, 8.95, None, None),
+    "CAXIAS SHOPPING": (6.95, 8.95, None, None),
+    "CHACARA SANTO ANTONIO": (6.95, 8.95, None, None),
+    "COPACABANA": (6.95, 8.95, None, None),
+    "ENGENHAO": (6.95, 8.95, None, None),
+    "ESPETARIA NOVA CAXIAS": (6.95, 8.95, None, None),
+    "GOIANIA - AV SAO JOAO": (6.95, 8.95, 7.95, 9.95),
+    "GRANDE RIO": (6.95, 8.95, 8.95, None),
+    "GUARULHOS": (6.95, 8.95, 7.95, 9.95),
+    "ICARAI": (6.95, 8.95, 5.99, None),
+    "JARDINS": (6.95, 8.95, 7.95, 9.95),
+    "MARICA": (6.95, 8.95, None, None),
+    "NEW YORK": (6.95, 8.95, None, None),
+    "OLEGARIO MACIEL": (6.95, 8.95, None, None),
+    "PANAMBY MORUMBI": (6.95, 8.95, None, None),
+    "PARK SHOPPING CAMPO GRANDE": (6.95, 8.95, 8.45, None),
+    "PIRATININGA": (6.95, 8.95, None, None),
+    "QUIOSQUE CABO FRIO SHOP. PARK": (6.95, 8.95, None, None),
+    "QUIOSQUE MACAE": (6.95, 8.95, None, None),
+    "QUIOSQUE NORTE SHOPPING": (6.95, 9.95, 7.95, None),
+    "RECREIO": (6.95, 8.95, None, None),
+    "RIO DAS OSTRAS": (6.95, 8.95, None, None),
+    "SALVADOR - RIO VERMELHO": (6.95, 8.95, 7.95, 9.95),
+    "SANTOS": (6.95, 8.95, None, None),
+    "SHOPPING JARDIM GUADALUPE": (6.95, 8.95, None, None),
+    "SULACAP": (7.95, 9.99, 10.95, 11.95),
+    "TATUAPE": (6.95, 8.95, 7.95, 9.95),
+    "UBERLANDIA": (6.95, 8.95, None, None),
+    "VALQUEIRE LOUNGE": (6.95, 8.95, None, None),
+    "VISTA ALEGRE": (6.95, 8.95, None, None),
+}
+
+
+def _chave_nome_loja_chopp(nome):
+    texto = " ".join(_normalizar_grupo(nome).split())
+    if texto.startswith("QUIOSQUE CABO FRIO"):
+        return "QUIOSQUE CABO FRIO SHOP. PARK"
+    return texto
+
+
+def _valores_iniciais_chopp_hh(lojas):
+    """Preços da planilha de CHOPP H.H, associados pelo nome da loja."""
+    valores = {}
+    for loja in lojas or []:
+        precos = _PRECOS_INICIAIS_CHOPP_HH.get(_chave_nome_loja_chopp(loja.get("nome")))
+        if not precos:
+            continue
+        valores[str(int(loja["codigo"]))] = {
+            coluna: preco
+            for coluna, preco in zip(_COLUNAS_CHOPP_HH, precos)
+        }
+    return valores
+
+
+def _valores_chopp_hh_das_lojas(lojas):
+    if _ARQUIVO_CHOPP_HH.is_file():
+        return _ler_valores_chopp_hh()
+    return _valores_iniciais_chopp_hh(lojas)
+
+
 def _nome_exibicao_loja_chopp(loja, nomes_repetidos):
     nome = str(loja.get("nome") or "").strip() or str(loja.get("codigo"))
     if nome in nomes_repetidos:
@@ -3661,22 +3727,12 @@ def main():
                     "🍺 CHOPP H.H — valor promocional por loja",
                     expanded=_exp_chopp_aberto,
                 ):
-                    st.markdown(
-                        "A coluna **Loja** traz todas as lojas disponíveis da Espetto Carioca. "
-                        "Tulipa Amstel, Tulipa Heineken, Caneca Amstel e Caneca Heineken "
-                        "são preenchidas manualmente."
-                    )
-                    st.caption(
-                        "Célula vazia: opção não configurada nesta loja. "
-                        "Na edição, use vírgula nos centavos (exemplo: 6,95)."
-                    )
                     with st.spinner("Carregando lojas disponíveis da marca…"):
                         lojas_chopp = listar_lojas_disponiveis_marca(int(codfranqueador))
                     if not lojas_chopp:
                         st.warning("Nenhuma loja disponível para esta marca.")
                     else:
-                        st.caption(f"{len(lojas_chopp)} lojas disponíveis.")
-                        valores_chopp = _ler_valores_chopp_hh()
+                        valores_chopp = _valores_chopp_hh_das_lojas(lojas_chopp)
                         df_chopp, df_chopp_edicao = montar_grades_chopp_hh(
                             lojas_chopp, valores_chopp
                         )
