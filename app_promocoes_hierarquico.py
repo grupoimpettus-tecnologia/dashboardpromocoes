@@ -11,6 +11,7 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 import io
 import json
 import html
+from pathlib import Path
 
 from hmg_promocoes_unidade import (
     BASE_PRD,
@@ -1612,223 +1613,186 @@ _COLUNAS_CHOPP_HH = (
     "Caneca Amstel H.H",
     "Caneca Heineken H.H",
 )
-
-
-def _grupo_vo_eh_chopp_hh(item):
-    """Etapa de escolha do combo CHOPP's H.H: 'CHOPP H.H - SELECIONE O CHOPP'."""
-    desc = _normalizar_grupo(item.get("grupoDescricao") or item.get("descricaoGrupo") or "")
-    return "CHOPP H.H" in desc
-
-
-def _coluna_opcao_chopp_hh(descricao):
-    """Mapeia a opção da etapa para a coluna da relação (tulipa/caneca Amstel e Heineken)."""
-    nome = _normalizar_grupo(descricao)
-    if "ZERO" in nome or "VINHO" in nome or "BRAHMA" in nome:
-        return None
-    if "TULIPA" in nome and "AMSTEL" in nome:
-        return "Tulipa Amstel H.H"
-    if "TULIPA" in nome and "HEINEKEN" in nome:
-        return "Tulipa Heineken H.H"
-    if "CANECA" in nome and "AMSTEL" in nome:
-        return "Caneca Amstel H.H"
-    if "CANECA" in nome and "HEINEKEN" in nome:
-        return "Caneca Heineken H.H"
-    return None
+_ARQUIVO_CHOPP_HH = Path(__file__).resolve().parent / "dados" / "chopp_hh_espetto.json"
 
 
 def _formatar_real(valor):
     if valor is None:
         return ""
-    texto = f"{float(valor):,.2f}"
+    try:
+        numero = float(valor)
+    except (TypeError, ValueError):
+        return ""
+    if pd.isna(numero):
+        return ""
+    texto = f"{numero:,.2f}"
     texto = texto.replace(",", "X").replace(".", ",").replace("X", ".")
     return f"R$ {texto}"
 
 
-def _escolher_valor_promocional_hh(linhas):
-    """
-    Valor promocional da opção dentro do Happy Hour.
-    Prefere HAPPY HOUR ESPETTACULAR 25 (vigente na maior parte da rede: 6,95 / 8,95).
-    Ignora a linha do combo pai CHOPP's H.H, que fica zerada.
-    """
-    candidatas = []
-    for ln in linhas or []:
-        if not isinstance(ln, dict):
+def _texto_edicao_chopp(valor):
+    if valor is None:
+        return ""
+    try:
+        numero = float(valor)
+    except (TypeError, ValueError):
+        return ""
+    if pd.isna(numero):
+        return ""
+    return f"{numero:.2f}".replace(".", ",")
+
+
+def _interpretar_celula_chopp(valor):
+    """(valido, numero). Célula vazia é válida e vale None."""
+    if valor is None or (isinstance(valor, float) and pd.isna(valor)):
+        return True, None
+    if isinstance(valor, bool):
+        return False, None
+    if isinstance(valor, (int, float)):
+        numero = round(float(valor), 2)
+        return (numero >= 0), (numero if numero >= 0 else None)
+    texto = str(valor).strip()
+    if texto in ("", "—", "-", "–"):
+        return True, None
+    limpo = texto.replace("R$", "").replace(" ", "")
+    if not limpo:
+        return True, None
+    if "," in limpo and "." in limpo:
+        limpo = limpo.replace(".", "").replace(",", ".")
+    elif "," in limpo:
+        limpo = limpo.replace(",", ".")
+    try:
+        numero = round(float(limpo), 2)
+    except ValueError:
+        return False, None
+    if numero < 0:
+        return False, None
+    return True, numero
+
+
+def _ler_valores_chopp_hh():
+    if not _ARQUIVO_CHOPP_HH.is_file():
+        return {}
+    try:
+        bruto = json.loads(_ARQUIVO_CHOPP_HH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, TypeError):
+        return {}
+    if not isinstance(bruto, dict):
+        return {}
+    limpo = {}
+    for codigo, colunas in bruto.items():
+        if not isinstance(colunas, dict):
             continue
-        if "HAPPY HOUR" not in _normalizar_grupo(ln.get("nomePromocao")):
-            continue
-        desc = _normalizar_grupo(ln.get("descricaoProduto"))
-        if "CHOPP" in desc and "H.H" in desc:
-            continue
-        valor = _valor_promocional_mix_numerico(ln.get("valorPromocionalMix"))
-        if valor is None or abs(valor) <= 0.005:
-            valor = _valor_promocional_mix_numerico(ln.get("valorMix"))
-        if valor is None or abs(valor) <= 0.005:
-            continue
-        nome = _normalizar_grupo(ln.get("nomePromocao"))
-        ativo = str(ln.get("produtoPromocaoAtivo") or "").strip().upper() == "S"
-        if "ESPE" in nome and "25" in nome:
-            rank = 0
-        elif "10/2025" in nome or "10 2025" in nome:
-            rank = 1
-        else:
-            rank = 2
-        candidatas.append((rank, 0 if ativo else 1, valor))
-    if not candidatas:
-        return None
-    candidatas.sort(key=lambda item: (item[0], item[1]))
-    return candidatas[0][2]
+        limpo[str(codigo)] = {
+            coluna: _interpretar_celula_chopp(colunas.get(coluna))[1]
+            for coluna in _COLUNAS_CHOPP_HH
+        }
+    return limpo
 
 
-def _carregar_catalogo_chopp_hh(token, codfranqueador):
-    """
-    Por venda orientada: opções da etapa CHOPP H.H e o conjunto de produtos
-    usado para associar a VO à loja.
-    """
-    url = f"{DEGUST_API_BASE.rstrip('/')}{_URL_VO_PRODUTO}"
-    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-
-    def _probe(codigo_vo):
-        try:
-            resp = requests.post(
-                url,
-                json={"codigoFranquia": int(codfranqueador), "vendaOrientada": int(codigo_vo)},
-                headers=headers,
-                timeout=12,
-            )
-            if resp.status_code != 200:
-                return None
-            opcoes = {}
-            todos = set()
-            for item in _extrair_lista_vo(resp.json()):
-                if not isinstance(item, dict) or item.get("produto") is None:
-                    continue
-                try:
-                    codigo = int(item.get("produto"))
-                except (TypeError, ValueError):
-                    continue
-                todos.add(codigo)
-                if not _grupo_vo_eh_chopp_hh(item):
-                    continue
-                if str(item.get("exibir") or "").strip().lower() in ("nao", "não", "n"):
-                    continue
-                coluna = _coluna_opcao_chopp_hh(item.get("produtoDescricao"))
-                if not coluna or coluna in opcoes:
-                    continue
-                opcoes[coluna] = {
-                    "codigo": codigo,
-                    "descricao": str(item.get("produtoDescricao") or "").strip(),
-                }
-            if not opcoes:
-                return None
-            return {
-                "vo": int(codigo_vo),
-                "opcoes": opcoes,
-                "todos": frozenset(todos),
-            }
-        except Exception:
-            return None
-
-    catalogo = []
-    workers = min(8, _VO_SCAN_MAX)
-    with ThreadPoolExecutor(max_workers=workers) as executor:
-        for item in executor.map(_probe, range(1, _VO_SCAN_MAX + 1)):
-            if item:
-                catalogo.append(item)
-    return catalogo
+def _gravar_valores_chopp_hh(valores):
+    _ARQUIVO_CHOPP_HH.parent.mkdir(parents=True, exist_ok=True)
+    saida = {}
+    for codigo, colunas in (valores or {}).items():
+        saida[str(codigo)] = {
+            coluna: _interpretar_celula_chopp((colunas or {}).get(coluna))[1]
+            for coluna in _COLUNAS_CHOPP_HH
+        }
+    temporario = _ARQUIVO_CHOPP_HH.with_suffix(".json.tmp")
+    temporario.write_text(
+        json.dumps(saida, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    temporario.replace(_ARQUIVO_CHOPP_HH)
 
 
-def _associar_vo_chopp_hh(cardapio_ids, catalogo):
-    melhor = None
-    melhor_score = -1.0
-    for item in catalogo or []:
-        base = item.get("todos") or frozenset()
-        if not base:
-            continue
-        score = len(set(cardapio_ids) & set(base)) / len(base)
-        if score > melhor_score:
-            melhor_score = score
-            melhor = item
-    if melhor is None or melhor_score < 0.50:
-        return None
-    return melhor
+def _nome_exibicao_loja_chopp(loja, nomes_repetidos):
+    nome = str(loja.get("nome") or "").strip() or str(loja.get("codigo"))
+    if nome in nomes_repetidos:
+        return f"{nome} ({loja.get('codigo')})"
+    return nome
 
 
 @st.cache_data(ttl=300)
-def carregar_opcoes_chopp_hh_por_loja(codfranqueador):
-    """
-    codigoLoja -> opções da etapa CHOPP H.H - Selecione o Chopp.
-    A associação loja/VO usa o cardápio da unidade.
-    """
+def listar_lojas_disponiveis_marca(codfranqueador):
+    """Lojas ativas da marca no cadastro Degust, ordenadas pelo nome."""
     try:
-        with requests.Session() as session:
-            token = autenticar(int(codfranqueador), session=session)
-            if not token:
-                return []
-            lojas = obter_lojas(token, int(codfranqueador), session=session)
-            catalogo = _carregar_catalogo_chopp_hh(token, int(codfranqueador))
-            if not lojas or not catalogo:
-                return []
-
-            def _loja(loja):
-                try:
-                    codigo = int(loja.get("codigoLoja"))
-                except (TypeError, ValueError):
-                    return None
-                with requests.Session() as sessao_loja:
-                    cardapio = _obter_ids_cardapio_loja(
-                        sessao_loja, token, int(codfranqueador), codigo
-                    )
-                vo = _associar_vo_chopp_hh(cardapio, catalogo)
-                opcoes = {}
-                if vo:
-                    for coluna, info in (vo.get("opcoes") or {}).items():
-                        opcoes[coluna] = int(info["codigo"])
-                return {
-                    "codigo": codigo,
-                    "nome": str(loja.get("nomeLoja") or "").strip(),
-                    "opcoes": opcoes,
-                }
-
-            workers = min(8, max(1, len(lojas)))
-            with ThreadPoolExecutor(max_workers=workers) as executor:
-                linhas = [item for item in executor.map(_loja, lojas) if item]
+        token = autenticar(int(codfranqueador))
+        if not token:
+            return []
+        brutas = obter_lojas(token, int(codfranqueador), session=None)
     except Exception:
         return []
+    linhas = []
+    for loja in brutas or []:
+        try:
+            codigo = int(loja.get("codigoLoja"))
+        except (TypeError, ValueError):
+            continue
+        nome = str(loja.get("nomeLoja") or "").strip() or str(codigo)
+        linhas.append({"codigo": codigo, "nome": nome})
     linhas.sort(key=lambda item: _normalizar_grupo(item.get("nome")))
+    repetidos = set()
+    vistos = set()
+    for item in linhas:
+        if item["nome"] in vistos:
+            repetidos.add(item["nome"])
+        vistos.add(item["nome"])
+    for item in linhas:
+        item["nome_exibicao"] = _nome_exibicao_loja_chopp(item, repetidos)
     return linhas
 
 
-def montar_relacao_chopp_hh(df_marca, opcoes_por_loja):
-    """Cruza as opções da etapa com o valor promocional de Happy Hour de cada loja."""
-    registros = []
-    if df_marca is None or getattr(df_marca, "empty", True):
-        df_marca = pd.DataFrame()
-    for loja in opcoes_por_loja or []:
-        try:
-            codigo = int(loja.get("codigo"))
-        except (TypeError, ValueError):
-            continue
-        if not df_marca.empty and "codigoLoja" in df_marca.columns:
-            sub = df_marca[pd.to_numeric(df_marca["codigoLoja"], errors="coerce") == codigo]
-        else:
-            sub = pd.DataFrame()
-        linha = {"Loja": loja.get("nome") or str(codigo)}
-        opcoes = loja.get("opcoes") or {}
+def montar_grades_chopp_hh(lojas, valores):
+    """Tabela de leitura (R$) e tabela de edição (texto com vírgula)."""
+    registros_exibicao = []
+    registros_edicao = []
+    for loja in lojas or []:
+        salvo = (valores or {}).get(str(int(loja["codigo"])), {})
+        nome = loja.get("nome_exibicao") or loja.get("nome") or str(loja.get("codigo"))
+        exibicao = {"Loja": nome}
+        edicao = {"Loja": nome}
         for coluna in _COLUNAS_CHOPP_HH:
-            codigo_produto = opcoes.get(coluna)
-            if codigo_produto is None:
-                linha[coluna] = ""
+            numero = _interpretar_celula_chopp((salvo or {}).get(coluna))[1]
+            exibicao[coluna] = _formatar_real(numero)
+            edicao[coluna] = _texto_edicao_chopp(numero)
+        registros_exibicao.append(exibicao)
+        registros_edicao.append(edicao)
+    colunas = ["Loja", *_COLUNAS_CHOPP_HH]
+    return (
+        pd.DataFrame(registros_exibicao, columns=colunas),
+        pd.DataFrame(registros_edicao, columns=colunas),
+    )
+
+
+def aplicar_edicao_chopp_hh(df_editado, valores_anteriores, lojas):
+    """Grava pelo nome da loja. A coluna Loja não é editável."""
+    if df_editado is None or getattr(df_editado, "empty", True):
+        return dict(valores_anteriores or {}), ["A tabela de edição veio vazia."]
+    por_nome = {}
+    for loja in lojas or []:
+        nome = str(loja.get("nome_exibicao") or loja.get("nome") or "").strip()
+        por_nome[nome] = loja
+    novos = dict(valores_anteriores or {})
+    erros = []
+    for _, row in df_editado.iterrows():
+        nome = str(row.get("Loja") or "").strip()
+        loja = por_nome.get(nome)
+        if loja is None:
+            erros.append(f"Loja não reconhecida: {nome}")
+            continue
+        item = {}
+        for coluna in _COLUNAS_CHOPP_HH:
+            ok, numero = _interpretar_celula_chopp(row.get(coluna))
+            if not ok:
+                erros.append(f"{nome} · {coluna}: {row.get(coluna)}")
                 continue
-            if sub.empty or "codigoProduto" not in sub.columns:
-                linha[coluna] = "—"
-                continue
-            do_produto = sub[pd.to_numeric(sub["codigoProduto"], errors="coerce") == int(codigo_produto)]
-            valor = _escolher_valor_promocional_hh(do_produto.to_dict("records"))
-            linha[coluna] = _formatar_real(valor) if valor is not None else "—"
-        registros.append(linha)
-    if not registros:
-        return pd.DataFrame(columns=["Loja", *_COLUNAS_CHOPP_HH])
-    return pd.DataFrame(registros, columns=["Loja", *_COLUNAS_CHOPP_HH])
+            item[coluna] = numero
+        if not erros:
+            novos[str(int(loja["codigo"]))] = item
+    if erros:
+        return dict(valores_anteriores or {}), erros
+    return novos, []
 
 
 def _obter_nome_venda_orientada_loja(session, token, codfranqueador, codigo_loja):
@@ -3687,56 +3651,117 @@ def main():
             
             if marca == "Promoções Espetto":
                 _exp_chopp = f"ui_exp_chopp_hh_{marca}"
-                _chave_chopp = f"chopp_hh_df_{marca}"
+                _edit_chopp = f"chopp_hh_editando_{marca}"
+                _rev_chopp = f"chopp_hh_rev_{marca}"
                 _exp_chopp_aberto = (
                     st.session_state.get(_exp_chopp, False)
-                    or st.session_state.get(_chave_chopp) is not None
+                    or st.session_state.get(_edit_chopp, False)
                 )
                 with st.expander(
                     "🍺 CHOPP H.H — valor promocional por loja",
                     expanded=_exp_chopp_aberto,
                 ):
                     st.markdown(
-                        "O combo **CHOPP's H.H** abre a etapa **CHOPP H.H - Selecione o Chopp**. "
-                        "A consulta percorre as lojas da Espetto Carioca, identifica essa etapa na "
-                        "venda orientada de cada unidade e mostra o **valor promocional de Happy Hour** "
-                        "de Tulipa Amstel, Tulipa Heineken, Caneca Amstel e Caneca Heineken."
+                        "A coluna **Loja** traz todas as lojas disponíveis da Espetto Carioca. "
+                        "Tulipa Amstel, Tulipa Heineken, Caneca Amstel e Caneca Heineken "
+                        "são preenchidas manualmente."
                     )
                     st.caption(
-                        "Célula vazia: a opção não está na etapa desta loja. "
-                        "Traço (—): a opção está na etapa, sem valor promocional de Happy Hour. "
-                        "O valor prefere a promoção HAPPY HOUR ESPETTACULAR 25."
+                        "Célula vazia: opção não configurada nesta loja. "
+                        "Na edição, use vírgula nos centavos (exemplo: 6,95)."
                     )
-                    if st.button(
-                        "Consultar CHOPP H.H em todas as lojas",
-                        key=f"btn_chopp_hh_{marca}",
-                        on_click=_session_flag_true_callback(_exp_chopp),
-                        use_container_width=True,
-                    ):
-                        with st.spinner(
-                            "Consultando a etapa CHOPP H.H e o valor promocional em todas as lojas…"
-                        ):
-                            opcoes = carregar_opcoes_chopp_hh_por_loja(int(codfranqueador))
-                            df_chopp = montar_relacao_chopp_hh(df_marca, opcoes)
-                        if df_chopp.empty:
-                            st.warning("Nenhuma loja retornou a etapa CHOPP H.H.")
+                    with st.spinner("Carregando lojas disponíveis da marca…"):
+                        lojas_chopp = listar_lojas_disponiveis_marca(int(codfranqueador))
+                    if not lojas_chopp:
+                        st.warning("Nenhuma loja disponível para esta marca.")
+                    else:
+                        st.caption(f"{len(lojas_chopp)} lojas disponíveis.")
+                        valores_chopp = _ler_valores_chopp_hh()
+                        df_chopp, df_chopp_edicao = montar_grades_chopp_hh(
+                            lojas_chopp, valores_chopp
+                        )
+                        editando_chopp = bool(st.session_state.get(_edit_chopp, False))
+                        if editando_chopp:
+                            editado_chopp = st.data_editor(
+                                df_chopp_edicao,
+                                use_container_width=True,
+                                height=min(720, len(df_chopp_edicao) * 35 + 50),
+                                hide_index=True,
+                                num_rows="fixed",
+                                disabled=["Loja"],
+                                key=f"editor_chopp_hh_{marca}_{st.session_state.get(_rev_chopp, 0)}",
+                                column_config={
+                                    "Loja": st.column_config.TextColumn(
+                                        "Loja",
+                                        disabled=True,
+                                        help="Lista automática das lojas disponíveis da marca.",
+                                    ),
+                                    **{
+                                        coluna: st.column_config.TextColumn(
+                                            coluna,
+                                            help="Exemplo: 6,95. Vazio se a opção não existir nesta loja.",
+                                        )
+                                        for coluna in _COLUNAS_CHOPP_HH
+                                    },
+                                },
+                            )
+                            col_salvar_chopp, col_cancelar_chopp = st.columns(2)
+                            with col_salvar_chopp:
+                                if st.button(
+                                    "Salvar valores",
+                                    key=f"btn_salvar_chopp_hh_{marca}",
+                                    use_container_width=True,
+                                    on_click=_session_flag_true_callback(_exp_chopp),
+                                ):
+                                    novos_chopp, erros_chopp = aplicar_edicao_chopp_hh(
+                                        editado_chopp, valores_chopp, lojas_chopp
+                                    )
+                                    if erros_chopp:
+                                        st.error(
+                                            "Não foi possível salvar. Ajuste as células: "
+                                            + "; ".join(str(item) for item in erros_chopp[:8])
+                                        )
+                                    else:
+                                        _gravar_valores_chopp_hh(novos_chopp)
+                                        st.session_state[_edit_chopp] = False
+                                        st.session_state[_rev_chopp] = (
+                                            int(st.session_state.get(_rev_chopp, 0)) + 1
+                                        )
+                                        st.rerun()
+                            with col_cancelar_chopp:
+                                if st.button(
+                                    "Cancelar",
+                                    key=f"btn_cancelar_chopp_hh_{marca}",
+                                    use_container_width=True,
+                                    on_click=_session_flag_true_callback(_exp_chopp),
+                                ):
+                                    st.session_state[_edit_chopp] = False
+                                    st.session_state[_rev_chopp] = (
+                                        int(st.session_state.get(_rev_chopp, 0)) + 1
+                                    )
+                                    st.rerun()
                         else:
-                            st.session_state[_chave_chopp] = df_chopp
-                    df_chopp_salvo = st.session_state.get(_chave_chopp)
-                    if isinstance(df_chopp_salvo, pd.DataFrame) and not df_chopp_salvo.empty:
-                        st.dataframe(
-                            df_chopp_salvo,
-                            use_container_width=True,
-                            height=min(720, len(df_chopp_salvo) * 35 + 50),
-                            hide_index=True,
-                        )
-                        st.download_button(
-                            label="⬇️ Download CHOPP H.H (Excel)",
-                            data=criar_excel_formatado(df_chopp_salvo),
-                            file_name=f"chopp_hh_espetto_{datetime.now().strftime('%Y%m%d')}.xlsx",
-                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                            key=f"download_chopp_hh_{marca}",
-                        )
+                            if st.button(
+                                "Editar valores",
+                                key=f"btn_editar_chopp_hh_{marca}",
+                                use_container_width=True,
+                                on_click=_session_flag_true_callback(_exp_chopp),
+                            ):
+                                st.session_state[_edit_chopp] = True
+                                st.rerun()
+                            st.dataframe(
+                                df_chopp,
+                                use_container_width=True,
+                                height=min(720, len(df_chopp) * 35 + 50),
+                                hide_index=True,
+                            )
+                            st.download_button(
+                                label="⬇️ Download CHOPP H.H (Excel)",
+                                data=criar_excel_formatado(df_chopp),
+                                file_name=f"chopp_hh_espetto_{datetime.now().strftime('%Y%m%d')}.xlsx",
+                                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                key=f"download_chopp_hh_{marca}",
+                            )
 
             _render_bloco_cliques_por_loja(
                 marca=marca,
