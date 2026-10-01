@@ -11,6 +11,7 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 import io
 import json
 import html
+import hmac
 from pathlib import Path
 
 from hmg_promocoes_unidade import (
@@ -1613,7 +1614,22 @@ _COLUNAS_CHOPP_HH = (
     "Caneca Amstel H.H",
     "Caneca Heineken H.H",
 )
-_ARQUIVO_CHOPP_HH = Path(__file__).resolve().parent / "dados" / "chopp_hh_espetto.json"
+_SENHA_EDICAO_CHOPP_HH = "Master10!!"
+_CODIGO_FRANQUEADOR_ESPETTO = 3078
+
+
+def _arquivo_chopp_hh(codfranqueador):
+    codigo = int(codfranqueador)
+    nome = "chopp_hh_espetto.json" if codigo == _CODIGO_FRANQUEADOR_ESPETTO else f"chopp_hh_{codigo}.json"
+    return Path(__file__).resolve().parent / "dados" / nome
+
+
+def _senha_edicao_chopp_confere(senha):
+    informada = str(senha or "")
+    esperada = str(_SENHA_EDICAO_CHOPP_HH)
+    if not informada or len(informada) != len(esperada):
+        return False
+    return hmac.compare_digest(informada, esperada)
 
 
 def _formatar_real(valor):
@@ -1670,11 +1686,12 @@ def _interpretar_celula_chopp(valor):
     return True, numero
 
 
-def _ler_valores_chopp_hh():
-    if not _ARQUIVO_CHOPP_HH.is_file():
+def _ler_valores_chopp_hh(codfranqueador):
+    arquivo = _arquivo_chopp_hh(codfranqueador)
+    if not arquivo.is_file():
         return {}
     try:
-        bruto = json.loads(_ARQUIVO_CHOPP_HH.read_text(encoding="utf-8"))
+        bruto = json.loads(arquivo.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError, TypeError):
         return {}
     if not isinstance(bruto, dict):
@@ -1690,20 +1707,21 @@ def _ler_valores_chopp_hh():
     return limpo
 
 
-def _gravar_valores_chopp_hh(valores):
-    _ARQUIVO_CHOPP_HH.parent.mkdir(parents=True, exist_ok=True)
+def _gravar_valores_chopp_hh(codfranqueador, valores):
+    arquivo = _arquivo_chopp_hh(codfranqueador)
+    arquivo.parent.mkdir(parents=True, exist_ok=True)
     saida = {}
     for codigo, colunas in (valores or {}).items():
         saida[str(codigo)] = {
             coluna: _interpretar_celula_chopp((colunas or {}).get(coluna))[1]
             for coluna in _COLUNAS_CHOPP_HH
         }
-    temporario = _ARQUIVO_CHOPP_HH.with_suffix(".json.tmp")
+    temporario = arquivo.with_suffix(".json.tmp")
     temporario.write_text(
         json.dumps(saida, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
-    temporario.replace(_ARQUIVO_CHOPP_HH)
+    temporario.replace(arquivo)
 
 
 _PRECOS_INICIAIS_CHOPP_HH = {
@@ -1766,10 +1784,12 @@ def _valores_iniciais_chopp_hh(lojas):
     return valores
 
 
-def _valores_chopp_hh_das_lojas(lojas):
-    if _ARQUIVO_CHOPP_HH.is_file():
-        return _ler_valores_chopp_hh()
-    return _valores_iniciais_chopp_hh(lojas)
+def _valores_chopp_hh_das_lojas(lojas, codfranqueador):
+    if _arquivo_chopp_hh(codfranqueador).is_file():
+        return _ler_valores_chopp_hh(codfranqueador)
+    if int(codfranqueador) == _CODIGO_FRANQUEADOR_ESPETTO:
+        return _valores_iniciais_chopp_hh(lojas)
+    return {}
 
 
 def _nome_exibicao_loja_chopp(loja, nomes_repetidos):
@@ -3715,13 +3735,15 @@ def main():
             with col5:
                 st.metric("📊 Total de Produtos", len(df_marca))
             
-            if marca == "Promoções Espetto":
+            if marca in MARCAS_CONFIG:
                 _exp_chopp = f"ui_exp_chopp_hh_{marca}"
                 _edit_chopp = f"chopp_hh_editando_{marca}"
+                _pedir_senha_chopp = f"chopp_hh_pedir_senha_{marca}"
                 _rev_chopp = f"chopp_hh_rev_{marca}"
                 _exp_chopp_aberto = (
                     st.session_state.get(_exp_chopp, False)
                     or st.session_state.get(_edit_chopp, False)
+                    or st.session_state.get(_pedir_senha_chopp, False)
                 )
                 with st.expander(
                     "🍺 CHOPP H.H — valor promocional por loja",
@@ -3732,7 +3754,9 @@ def main():
                     if not lojas_chopp:
                         st.warning("Nenhuma loja disponível para esta marca.")
                     else:
-                        valores_chopp = _valores_chopp_hh_das_lojas(lojas_chopp)
+                        valores_chopp = _valores_chopp_hh_das_lojas(
+                            lojas_chopp, codfranqueador
+                        )
                         df_chopp, df_chopp_edicao = montar_grades_chopp_hh(
                             lojas_chopp, valores_chopp
                         )
@@ -3778,7 +3802,7 @@ def main():
                                             + "; ".join(str(item) for item in erros_chopp[:8])
                                         )
                                     else:
-                                        _gravar_valores_chopp_hh(novos_chopp)
+                                        _gravar_valores_chopp_hh(codfranqueador, novos_chopp)
                                         st.session_state[_edit_chopp] = False
                                         st.session_state[_rev_chopp] = (
                                             int(st.session_state.get(_rev_chopp, 0)) + 1
@@ -3797,13 +3821,41 @@ def main():
                                     )
                                     st.rerun()
                         else:
-                            if st.button(
+                            if st.session_state.get(_pedir_senha_chopp, False):
+                                with st.form(key=f"form_senha_chopp_hh_{marca}"):
+                                    senha_chopp = st.text_input(
+                                        "Senha para editar",
+                                        type="password",
+                                    )
+                                    col_confirma_senha, col_volta_senha = st.columns(2)
+                                    with col_confirma_senha:
+                                        confirmar_senha_chopp = st.form_submit_button(
+                                            "Confirmar",
+                                            use_container_width=True,
+                                        )
+                                    with col_volta_senha:
+                                        voltar_senha_chopp = st.form_submit_button(
+                                            "Voltar",
+                                            use_container_width=True,
+                                        )
+                                if confirmar_senha_chopp:
+                                    st.session_state[_exp_chopp] = True
+                                    if _senha_edicao_chopp_confere(senha_chopp):
+                                        st.session_state[_edit_chopp] = True
+                                        st.session_state[_pedir_senha_chopp] = False
+                                        st.rerun()
+                                    st.error("Senha incorreta.")
+                                elif voltar_senha_chopp:
+                                    st.session_state[_exp_chopp] = True
+                                    st.session_state[_pedir_senha_chopp] = False
+                                    st.rerun()
+                            elif st.button(
                                 "Editar valores",
                                 key=f"btn_editar_chopp_hh_{marca}",
                                 use_container_width=True,
                                 on_click=_session_flag_true_callback(_exp_chopp),
                             ):
-                                st.session_state[_edit_chopp] = True
+                                st.session_state[_pedir_senha_chopp] = True
                                 st.rerun()
                             st.dataframe(
                                 df_chopp,
@@ -3814,7 +3866,7 @@ def main():
                             st.download_button(
                                 label="⬇️ Download CHOPP H.H (Excel)",
                                 data=criar_excel_formatado(df_chopp),
-                                file_name=f"chopp_hh_espetto_{datetime.now().strftime('%Y%m%d')}.xlsx",
+                                file_name=f"chopp_hh_{int(codfranqueador)}_{datetime.now().strftime('%Y%m%d')}.xlsx",
                                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                                 key=f"download_chopp_hh_{marca}",
                             )
